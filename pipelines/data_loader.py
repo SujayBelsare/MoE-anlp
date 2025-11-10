@@ -7,7 +7,10 @@ from torch.utils.data import Dataset, DataLoader
 from datasets import load_dataset
 from transformers import AutoTokenizer
 from typing import Dict, List, Optional
-import config
+from configs import load_config
+
+# Load default configuration
+config = load_config()
 
 
 class XSumDataset(Dataset):
@@ -38,7 +41,7 @@ class XSumDataset(Dataset):
         
         # Load dataset from HuggingFace
         print(f"Loading XSum dataset split: {split}")
-        self.dataset = load_dataset(config.DATASET_NAME, split=split)
+        self.dataset = load_dataset(config['dataset']['name'], split=split)
         
         # Optionally limit dataset size
         if num_samples is not None:
@@ -104,14 +107,18 @@ class XSumDataModule:
     def __init__(
         self,
         tokenizer_name: str,
-        batch_size: int = config.BATCH_SIZE,
-        max_source_length: int = config.MAX_SOURCE_LENGTH,
-        max_target_length: int = config.MAX_TARGET_LENGTH,
+        batch_size: int = None,
+        max_source_length: int = None,
+        max_target_length: int = None,
         num_workers: int = 4,
         train_samples: Optional[int] = None,
         val_samples: Optional[int] = None,
         test_samples: Optional[int] = None
     ):
+        # Use config defaults if not provided
+        self.batch_size = batch_size or config['training']['batch_size']
+        self.max_source_length = max_source_length or config['dataset']['max_source_length']
+        self.max_target_length = max_target_length or config['dataset']['max_target_length']
         """
         Args:
             tokenizer_name: Name or path of tokenizer
@@ -200,13 +207,17 @@ class XSumDataModule:
 def get_data_loader(
     tokenizer,
     split: str,
-    batch_size: int = config.BATCH_SIZE,
-    max_source_length: int = config.MAX_SOURCE_LENGTH,
-    max_target_length: int = config.MAX_TARGET_LENGTH,
+    batch_size: int = None,
+    max_source_length: int = None,
+    max_target_length: int = None,
     shuffle: bool = None,
     num_workers: int = 4,
     num_samples: Optional[int] = None
 ) -> DataLoader:
+    # Use config defaults if not provided
+    batch_size = batch_size or config['training']['batch_size']
+    max_source_length = max_source_length or config['dataset']['max_source_length']
+    max_target_length = max_target_length or config['dataset']['max_target_length']
     """
     Factory function to create a dataloader for a specific split.
     

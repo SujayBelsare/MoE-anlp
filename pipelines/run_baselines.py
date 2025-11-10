@@ -14,11 +14,10 @@ from transformers import (
 )
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
-import argparse
 import os
 from tqdm import tqdm
 import json
-import config
+from config import load_config, DEFAULT_CONFIG as config
 from utils import set_seed, ensure_dir
 
 
@@ -504,76 +503,47 @@ class InstructionTuner:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run baseline models")
-    parser.add_argument("--task", type=str, required=True,
-                       choices=["bart_inference", "finetune", "instruction_tune"],
-                       help="Task to run")
-    parser.add_argument("--model", type=str, help="Model name")
-    parser.add_argument("--output_dir", type=str, default="outputs",
-                       help="Output directory")
-    parser.add_argument("--use_peft", action="store_true", default=True,
-                       help="Use PEFT (LoRA)")
-    parser.add_argument("--use_quantization", action="store_true",
-                       help="Use quantization (8-bit for seq2seq, 4-bit for causal)")
-    parser.add_argument("--epochs", type=int, default=3,
-                       help="Number of epochs")
-    parser.add_argument("--batch_size", type=int, default=8,
-                       help="Batch size")
-    parser.add_argument("--learning_rate", type=float, default=5e-5,
-                       help="Learning rate")
-    parser.add_argument("--debug", action="store_true",
-                       help="Use small dataset for debugging")
-    parser.add_argument("--train_samples", type=int, default=None,
-                       help="Limit training samples")
-    parser.add_argument("--val_samples", type=int, default=None,
-                       help="Limit validation samples")
-    parser.add_argument("--push_to_hub", action="store_true",
-                       help="Push to HuggingFace Hub")
-    parser.add_argument("--seed", type=int, default=42,
-                       help="Random seed")
-    
-    args = parser.parse_args()
+    # Load configuration
+    config = load_config()
     
     # Set seed
-    set_seed(args.seed)
+    set_seed(config["training"]["seed"])
     
     # Debug mode
-    if args.debug:
-        args.train_samples = 100
-        args.val_samples = 50
-        args.epochs = 1
+    if config["mode"]["debug"]:
+        config["dataset"]["train_samples"] = 100
+        config["dataset"]["val_samples"] = 50
+        config["training"]["epochs"] = 1
         print("DEBUG MODE: Using small dataset")
     
     # Run task
-    if args.task == "bart_inference":
+    if config["mode"]["task"] == "bart_inference":
         print("Running BART inference...")
         bart = BARTInference()
         predictions, references = bart.run_on_test_set(
-            output_path=f"{args.output_dir}/bart_predictions.json"
+            output_path=f"{config['paths']['outputs']}/bart_predictions.json"
         )
         print(f"Generated {len(predictions)} summaries")
     
-    elif args.task == "finetune":
-        if not args.model:
-            args.model = "google-t5/t5-base"
-        
-        print(f"Fine-tuning {args.model}...")
+    elif config["mode"]["task"] == "finetune":
+        model = config["model"].get("name", "google-t5/t5-base")
+        print(f"Fine-tuning {model}...")
         finetuner = EncoderDecoderFineTuner(
-            model_name=args.model,
-            use_peft=args.use_peft,
-            use_8bit=args.use_quantization
+            model_name=model,
+            use_peft=config["training"]["use_peft"],
+            use_8bit=config["training"].get("use_quantization", False)
         )
         
-        output_dir = f"{args.output_dir}/finetuned_{args.model.split('/')[-1]}"
+        output_dir = f"{config['paths']['outputs']}/finetuned_{model.split('/')[-1]}"
         
         trainer = finetuner.train(
             output_dir=output_dir,
-            num_epochs=args.epochs,
-            batch_size=args.batch_size,
-            learning_rate=args.learning_rate,
-            train_samples=args.train_samples,
-            val_samples=args.val_samples,
-            push_to_hub=args.push_to_hub
+            num_epochs=config["training"]["epochs"],
+            batch_size=config["training"]["batch_size"],
+            learning_rate=config["training"]["learning_rate"],
+            train_samples=config["dataset"]["train_samples"],
+            val_samples=config["dataset"]["val_samples"],
+            push_to_hub=config["huggingface"]["push_to_hub"]
         )
         
         # Run inference on test set
@@ -592,27 +562,26 @@ def main():
             json.dump(results, f, indent=2)
         print(f"Results saved to {result_path}")
     
-    elif args.task == "instruction_tune":
-        if not args.model:
-            args.model = "meta-llama/Llama-3.2-1B-Instruct"
+    elif config["mode"]["task"] == "instruction_tune":
+        model = config["model"].get("name", "meta-llama/Llama-3.2-1B-Instruct")
         
-        print(f"Instruction tuning {args.model}...")
+        print(f"Instruction tuning {model}...")
         tuner = InstructionTuner(
-            model_name=args.model,
-            use_peft=args.use_peft,
-            use_4bit=args.use_quantization
+            model_name=model,
+            use_peft=config["training"]["use_peft"],
+            use_4bit=config["training"].get("use_quantization", False)
         )
         
-        output_dir = f"{args.output_dir}/instruction_tuned_{args.model.split('/')[-1]}"
+        output_dir = f"{config['paths']['outputs']}/instruction_tuned_{model.split('/')[-1]}"
         
         trainer = tuner.train(
             output_dir=output_dir,
-            num_epochs=args.epochs,
-            batch_size=args.batch_size,
-            learning_rate=args.learning_rate,
-            train_samples=args.train_samples,
-            val_samples=args.val_samples,
-            push_to_hub=args.push_to_hub
+            num_epochs=config["training"]["epochs"],
+            batch_size=config["training"]["batch_size"],
+            learning_rate=config["training"]["learning_rate"],
+            train_samples=config["dataset"]["train_samples"],
+            val_samples=config["dataset"]["val_samples"],
+            push_to_hub=config["huggingface"]["push_to_hub"]
         )
         
         # Run inference on test set

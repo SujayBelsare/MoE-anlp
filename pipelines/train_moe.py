@@ -7,7 +7,6 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import get_linear_schedule_with_warmup
 from transformers import AutoTokenizer
-import argparse
 import os
 from tqdm import tqdm
 import wandb
@@ -15,11 +14,14 @@ from pathlib import Path
 import json
 import numpy as np
 
-import config
+from configs import load_config
 from models.transformer import MoETransformer
 from pipelines.data_loader import XSumDataModule
 from utils import set_seed, ensure_dir, save_checkpoint, count_parameters, format_time
 import time
+
+# Load default configuration
+config = load_config()
 
 
 class MoETrainer:
@@ -343,107 +345,38 @@ class MoETrainer:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train MoE Transformer for summarization")
+    # Load configuration
+    config = load_config()
     
-    # Model arguments
-    parser.add_argument("--routing", type=str, default="topk", choices=["hash", "topk"],
-                       help="Routing algorithm")
-    parser.add_argument("--num_experts", type=int, default=config.NUM_EXPERTS,
-                       help="Number of experts")
-    parser.add_argument("--top_k", type=int, default=config.TOP_K,
-                       help="Number of experts to route to")
-    parser.add_argument("--use_load_balancer", action="store_true",
-                       help="Use load balancer loss")
-    parser.add_argument("--load_balancer_weight", type=float, default=config.LOAD_BALANCER_WEIGHT,
-                       help="Weight for load balancer loss")
-    
-    # Architecture arguments
-    parser.add_argument("--d_model", type=int, default=config.D_MODEL,
-                       help="Model dimension")
-    parser.add_argument("--n_heads", type=int, default=config.N_HEADS,
-                       help="Number of attention heads")
-    parser.add_argument("--n_layers", type=int, default=config.N_LAYERS,
-                       help="Number of layers")
-    parser.add_argument("--d_ff", type=int, default=config.D_FF,
-                       help="Feed-forward dimension")
-    parser.add_argument("--dropout", type=float, default=config.DROPOUT,
-                       help="Dropout rate")
-    
-    # Training arguments
-    parser.add_argument("--batch_size", type=int, default=config.BATCH_SIZE,
-                       help="Batch size")
-    parser.add_argument("--epochs", type=int, default=config.NUM_EPOCHS,
-                       help="Number of epochs")
-    parser.add_argument("--lr", type=float, default=config.LEARNING_RATE,
-                       help="Learning rate")
-    parser.add_argument("--warmup_steps", type=int, default=config.WARMUP_STEPS,
-                       help="Warmup steps")
-    parser.add_argument("--gradient_accumulation_steps", type=int, 
-                       default=config.GRADIENT_ACCUMULATION_STEPS,
-                       help="Gradient accumulation steps")
-    parser.add_argument("--max_grad_norm", type=float, default=config.MAX_GRAD_NORM,
-                       help="Max gradient norm for clipping")
-    
-    # Data arguments
-    parser.add_argument("--tokenizer", type=str, default="facebook/bart-base",
-                       help="Tokenizer to use")
-    parser.add_argument("--max_source_length", type=int, default=config.MAX_SOURCE_LENGTH,
-                       help="Max source length")
-    parser.add_argument("--max_target_length", type=int, default=config.MAX_TARGET_LENGTH,
-                       help="Max target length")
-    parser.add_argument("--num_workers", type=int, default=4,
-                       help="Number of dataloader workers")
-    
-    # Debug arguments
-    parser.add_argument("--debug", action="store_true",
-                       help="Use small dataset for debugging")
-    parser.add_argument("--train_samples", type=int, default=None,
-                       help="Limit training samples")
-    parser.add_argument("--val_samples", type=int, default=None,
-                       help="Limit validation samples")
-    
-    # Other arguments
-    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints",
-                       help="Checkpoint directory")
-    parser.add_argument("--log_dir", type=str, default="logs",
-                       help="Log directory")
-    parser.add_argument("--seed", type=int, default=42,
-                       help="Random seed")
-    parser.add_argument("--no_wandb", action="store_true",
-                       help="Disable wandb logging")
-    parser.add_argument("--push_to_hub", action="store_true",
-                       help="Push model to HuggingFace Hub")
-    parser.add_argument("--hf_username", type=str, default=config.HF_USERNAME,
-                       help="HuggingFace username")
-    
-    args = parser.parse_args()
+    # Debug mode configuration
+    debug_config = config.get('debug', {})
+    if debug_config.get('enabled', False):
+        config['training']['train_samples'] = debug_config.get('train_samples', 100)
+        config['training']['val_samples'] = debug_config.get('val_samples', 50)
+        config['training']['num_epochs'] = debug_config.get('num_epochs', 2)
+        print("DEBUG MODE: Using small dataset")
     
     # Set seed for reproducibility
-    set_seed(args.seed)
+    set_seed(config["training"]["seed"])
     
     # Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # Debug mode
-    if args.debug:
-        args.train_samples = 100
-        args.val_samples = 50
-        args.epochs = 2
-        print("DEBUG MODE: Using small dataset")
+    # Debug mode was already handled in debug_config section above
     
     # Initialize wandb
-    use_wandb = not args.no_wandb
+    use_wandb = config["wandb"]["enabled"]
     if use_wandb:
         wandb.init(
-            project="anlp-moe-xsum",
-            name=f"moe_{args.routing}_k{args.top_k}_e{args.num_experts}",
-            config=vars(args)
+            project=config["wandb"]["project"],
+            name=f"moe_{config['model']['routing']}_k{config['moe']['top_k']}_e{config['moe']['num_experts']}",
+            config=config
         )
     
     # Load tokenizer
-    print(f"Loading tokenizer: {args.tokenizer}")
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+    print(f"Loading tokenizer: {config['model']['tokenizer']}")
+    tokenizer = AutoTokenizer.from_pretrained(config['model']['tokenizer'])
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
@@ -453,13 +386,13 @@ def main():
     # Create data module
     print("Loading dataset...")
     data_module = XSumDataModule(
-        tokenizer_name=args.tokenizer,
-        batch_size=args.batch_size,
-        max_source_length=args.max_source_length,
-        max_target_length=args.max_target_length,
-        num_workers=args.num_workers,
-        train_samples=args.train_samples,
-        val_samples=args.val_samples
+        tokenizer_name=config['model']['tokenizer'],
+        batch_size=config['training']['batch_size'],
+        max_source_length=config['dataset']['max_source_length'],
+        max_target_length=config['dataset']['max_target_length'],
+        num_workers=config['dataset']['num_workers'],
+        train_samples=config['dataset']['train_samples'],
+        val_samples=config['dataset']['val_samples']
     )
     
     train_loader = data_module.train_dataloader()
@@ -469,19 +402,19 @@ def main():
     print(f"Val batches: {len(val_loader)}")
     
     # Create model
-    print(f"\nCreating MoE Transformer with {args.routing} routing...")
+    print(f"\nCreating MoE Transformer with {config['model']['routing']} routing...")
     model = MoETransformer(
         vocab_size=vocab_size,
-        d_model=args.d_model,
-        n_heads=args.n_heads,
-        n_layers=args.n_layers,
-        d_ff=args.d_ff,
-        num_experts=args.num_experts,
-        top_k=args.top_k,
-        router_type=args.routing,
-        load_balancer_weight=args.load_balancer_weight,
-        use_load_balancer_loss=args.use_load_balancer,
-        dropout=args.dropout,
+        d_model=config['model']['d_model'],
+        n_heads=config['model']['n_heads'],
+        n_layers=config['model']['n_layers'],
+        d_ff=config['model']['d_ff'],
+        num_experts=config['moe']['num_experts'],
+        top_k=config['moe']['top_k'],
+        router_type=config['model']['routing'],
+        load_balancer_weight=config['moe']['load_balancer_weight'],
+        use_load_balancer_loss=config['moe']['use_load_balancer'],
+        dropout=config['model']['dropout'],
         pad_token_id=tokenizer.pad_token_id,
         use_moe_encoder=True,
         use_moe_decoder=True
@@ -492,32 +425,32 @@ def main():
     print(f"Trainable parameters: {trainable_params:,}")
     
     # Create optimizer
-    optimizer = AdamW(model.parameters(), lr=args.lr)
+    optimizer = AdamW(model.parameters(), lr=config['training']['learning_rate'])
     
     # Create scheduler
-    total_steps = len(train_loader) * args.epochs // args.gradient_accumulation_steps
+    total_steps = len(train_loader) * config['training']['epochs'] // config['training']['gradient_accumulation_steps']
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
-        num_warmup_steps=args.warmup_steps,
+        num_warmup_steps=config['training']['warmup_steps'],
         num_training_steps=total_steps
     )
     
     # Create checkpoint directory name
     checkpoint_dir = os.path.join(
-        args.checkpoint_dir,
-        f"moe_{args.routing}_k{args.top_k}_e{args.num_experts}"
+        config['paths']['checkpoints'],
+        f"moe_{config['model']['routing']}_k{config['moe']['top_k']}_e{config['moe']['num_experts']}"
     )
     
-    # Create config dict
+    # Create config dict for trainer
     config_dict = {
-        'routing': args.routing,
-        'num_experts': args.num_experts,
-        'top_k': args.top_k,
-        'use_load_balancer': args.use_load_balancer,
-        'load_balancer_weight': args.load_balancer_weight,
-        'gradient_accumulation_steps': args.gradient_accumulation_steps,
-        'max_grad_norm': args.max_grad_norm,
-        'hf_username': args.hf_username
+        'routing': config['model']['routing'],
+        'num_experts': config['moe']['num_experts'],
+        'top_k': config['moe']['top_k'],
+        'use_load_balancer': config['moe']['use_load_balancer'],
+        'load_balancer_weight': config['moe']['load_balancer_weight'],
+        'gradient_accumulation_steps': config['training']['gradient_accumulation_steps'],
+        'max_grad_norm': config['training']['max_grad_norm'],
+        'hf_username': config['huggingface']['username']
     }
     
     # Create trainer
@@ -531,15 +464,15 @@ def main():
         device=device,
         config_dict=config_dict,
         checkpoint_dir=checkpoint_dir,
-        log_dir=args.log_dir,
+        log_dir=config['paths']['logs'],
         use_wandb=use_wandb
     )
     
     # Train
     trainer.train(
-        num_epochs=args.epochs,
+        num_epochs=config['training']['epochs'],
         save_every=1,
-        push_to_hub=args.push_to_hub
+        push_to_hub=config['huggingface']['push_to_hub']
     )
     
     if use_wandb:

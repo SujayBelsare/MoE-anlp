@@ -2,32 +2,26 @@
 Main entry point for the project
 """
 
-import argparse
+from configs import load_config
 from pipelines import run_baselines, train_moe, evaluate
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Advanced NLP Assignment 3")
-    parser.add_argument("--mode", type=str, required=True,
-                       choices=["baseline", "train", "evaluate"],
-                       help="Mode to run")
-    parser.add_argument("--model", type=str, help="Model name")
-    parser.add_argument("--routing", type=str, choices=["hash", "topk"],
-                       help="Routing algorithm for MoE")
-    parser.add_argument("--config", type=str, default="config.py",
-                       help="Path to config file")
+    # Load configuration
+    config = load_config()
     
-    args = parser.parse_args()
+    # Run in specified mode from config
+    mode = config.get('mode', 'train')
     
-    if args.mode == "baseline":
+    if mode == "baseline":
         print("Running baseline experiments...")
-        # Add baseline execution logic
-    elif args.mode == "train":
+        run_baselines.main()
+    elif mode == "train":
         print("Training MoE model...")
-        # Add training logic
-    elif args.mode == "evaluate":
+        train_moe.main()
+    elif mode == "evaluate":
         print("Evaluating models...")
-        # Add evaluation logic
+        evaluate.main()
 
 
 if __name__ == "__main__":

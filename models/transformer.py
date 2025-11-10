@@ -7,7 +7,10 @@ import torch.nn as nn
 import math
 from typing import Optional, Tuple
 from models.moe_layer import SparseMoELayer
-import config
+from configs import load_config
+
+# Load default configuration
+config = load_config()
 
 
 class PositionalEncoding(nn.Module):
@@ -272,21 +275,30 @@ class MoETransformer(nn.Module):
     def __init__(
         self,
         vocab_size: int,
-        d_model: int = config.D_MODEL,
-        n_heads: int = config.N_HEADS,
-        n_layers: int = config.N_LAYERS,
-        d_ff: int = config.D_FF,
-        num_experts: int = config.NUM_EXPERTS,
-        top_k: int = config.TOP_K,
+        d_model: int = None,
+        n_heads: int = None,
+        n_layers: int = None,
+        d_ff: int = None,
+        num_experts: int = None,
+        top_k: int = None,
         router_type: str = "topk",  # "topk" or "hash"
-        load_balancer_weight: float = config.LOAD_BALANCER_WEIGHT,
+        load_balancer_weight: float = None,
         use_load_balancer_loss: bool = False,
-        dropout: float = config.DROPOUT,
+        dropout: float = None,
         max_len: int = 5000,
         pad_token_id: int = 0,
         use_moe_encoder: bool = True,
         use_moe_decoder: bool = True
     ):
+        # Use config defaults if not provided
+        self.d_model = d_model or config['model']['d_model']
+        self.n_heads = n_heads or config['model']['n_heads']
+        self.n_layers = n_layers or config['model']['n_layers']
+        self.d_ff = d_ff or config['model']['d_ff']
+        self.num_experts = num_experts or config['moe']['num_experts']
+        self.top_k = top_k or config['moe']['top_k']
+        self.load_balancer_weight = load_balancer_weight or config['moe']['load_balancer_weight']
+        self.dropout = dropout or config['model']['dropout']
         super().__init__()
         
         self.d_model = d_model
