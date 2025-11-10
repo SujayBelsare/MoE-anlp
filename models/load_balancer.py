@@ -6,7 +6,7 @@ Implements auxiliary loss to encourage balanced expert usage
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from typing import Optional
 
 class LoadBalancer:
     """
@@ -30,7 +30,7 @@ class LoadBalancer:
         self,
         gate_logits: torch.Tensor,
         expert_mask: torch.Tensor,
-        expert_indices: torch.Tensor = None
+        expert_indices: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Compute the load balancing loss.
@@ -125,7 +125,7 @@ class LoadBalancer:
         self,
         gate_logits: torch.Tensor,
         expert_mask: torch.Tensor,
-        expert_indices: torch.Tensor = None,
+        expert_indices: Optional[torch.Tensor] = None,
         use_importance_loss: bool = False,
         use_z_loss: bool = True
     ) -> torch.Tensor:

@@ -89,6 +89,8 @@ class SparseMoELayer(nn.Module):
         
         # For tracking expert usage
         self.register_buffer("expert_usage", torch.zeros(num_experts))
+
+        self.expert_usage = torch.zeros(num_experts)
         
     def forward(
         self, 

@@ -28,6 +28,7 @@ class PositionalEncoding(nn.Module):
         pe[:, 1::2] = torch.cos(position * div_term)
         
         self.register_buffer('pe', pe.unsqueeze(0))
+        self.pe: torch.Tensor
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -275,16 +276,16 @@ class MoETransformer(nn.Module):
     def __init__(
         self,
         vocab_size: int,
-        d_model: int = None,
-        n_heads: int = None,
-        n_layers: int = None,
-        d_ff: int = None,
-        num_experts: int = None,
-        top_k: int = None,
+        d_model: Optional[int] = None,
+        n_heads: Optional[int] = None,
+        n_layers: Optional[int] = None,
+        d_ff: Optional[int] = None,
+        num_experts: Optional[int] = None,
+        top_k: Optional[int] = None,
         router_type: str = "topk",  # "topk" or "hash"
-        load_balancer_weight: float = None,
+        load_balancer_weight: Optional[float] = None,
         use_load_balancer_loss: bool = False,
-        dropout: float = None,
+        dropout_rate: Optional[float] = None,
         max_len: int = 5000,
         pad_token_id: int = 0,
         use_moe_encoder: bool = True,
@@ -298,10 +299,9 @@ class MoETransformer(nn.Module):
         self.num_experts = num_experts or config['moe']['num_experts']
         self.top_k = top_k or config['moe']['top_k']
         self.load_balancer_weight = load_balancer_weight or config['moe']['load_balancer_weight']
-        self.dropout = dropout or config['model']['dropout']
+        self.dropout_rate = dropout_rate or config['model']['dropout_rate']
         super().__init__()
         
-        self.d_model = d_model
         self.pad_token_id = pad_token_id
         self.use_load_balancer_loss = use_load_balancer_loss
         
@@ -311,44 +311,44 @@ class MoETransformer(nn.Module):
         
         # Create router
         if router_type == "hash":
-            router = HashRouting(num_experts)
+            router = HashRouting(self.num_experts)
         elif router_type == "topk":
             router = TokenChoiceTopKRouting(use_softmax=True)
         else:
             raise ValueError(f"Unknown router type: {router_type}")
         
         # Create load balancer
-        load_balancer = LoadBalancer(num_experts, load_balancer_weight) if use_load_balancer_loss else None
+        load_balancer = LoadBalancer(self.num_experts, self.load_balancer_weight) if use_load_balancer_loss else None
         
         # Embeddings
-        self.encoder_embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_token_id)
-        self.decoder_embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_token_id)
+        self.encoder_embedding = nn.Embedding(vocab_size, self.d_model, padding_idx=self.pad_token_id)
+        self.decoder_embedding = nn.Embedding(vocab_size, self.d_model, padding_idx=self.pad_token_id)
         
         # Positional encoding
-        self.pos_encoding = PositionalEncoding(d_model, max_len)
+        self.pos_encoding = PositionalEncoding(self.d_model, max_len)
         
         # Encoder layers
         self.encoder_layers = nn.ModuleList([
             TransformerEncoderLayer(
-                d_model, n_heads, d_ff, num_experts, top_k,
-                router, load_balancer, use_load_balancer_loss, dropout, use_moe_encoder
+                self.d_model, self.n_heads, self.d_ff, self.num_experts, self.top_k,
+                router, load_balancer, use_load_balancer_loss, self.dropout_rate, use_moe_encoder
             )
-            for _ in range(n_layers)
+            for _ in range(self.n_layers)
         ])
         
         # Decoder layers
         self.decoder_layers = nn.ModuleList([
             TransformerDecoderLayer(
-                d_model, n_heads, d_ff, num_experts, top_k,
-                router, load_balancer, use_load_balancer_loss, dropout, use_moe_decoder
+                self.d_model, self.n_heads, self.d_ff, self.num_experts, self.top_k,
+                router, load_balancer, use_load_balancer_loss, self.dropout_rate, use_moe_decoder
             )
-            for _ in range(n_layers)
+            for _ in range(self.n_layers)
         ])
         
         # Output projection
-        self.output_proj = nn.Linear(d_model, vocab_size)
+        self.output_proj = nn.Linear(self.d_model, vocab_size)
         
-        self.dropout = nn.Dropout(dropout)
+        self.dropout : torch.nn.Dropout = nn.Dropout(self.dropout_rate) 
         
         # Initialize weights
         self._init_weights()
@@ -416,11 +416,11 @@ class MoETransformer(nn.Module):
         x = self.dropout(x)
         
         # Apply encoder layers
-        total_lb_loss = 0
+        total_lb_loss: Optional[torch.Tensor] = None
         for layer in self.encoder_layers:
             x, lb_loss = layer(x, src_mask, return_load_balancer_loss)
             if lb_loss is not None:
-                total_lb_loss += lb_loss
+                total_lb_loss = lb_loss if total_lb_loss is None else total_lb_loss + lb_loss
         
         return x, total_lb_loss if return_load_balancer_loss else None
     
@@ -428,8 +428,8 @@ class MoETransformer(nn.Module):
         self,
         tgt: torch.Tensor,
         encoder_output: torch.Tensor,
-        src_mask: torch.Tensor,
-        tgt_mask: torch.Tensor,
+        src_mask: Optional[torch.Tensor] = None,
+        tgt_mask: Optional[torch.Tensor] = None,
         return_load_balancer_loss: bool = False
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
@@ -451,11 +451,11 @@ class MoETransformer(nn.Module):
         x = self.dropout(x)
         
         # Apply decoder layers
-        total_lb_loss = 0
+        total_lb_loss: Optional[torch.Tensor] = None
         for layer in self.decoder_layers:
             x, lb_loss = layer(x, encoder_output, src_mask, tgt_mask, return_load_balancer_loss)
             if lb_loss is not None:
-                total_lb_loss += lb_loss
+                total_lb_loss = lb_loss if total_lb_loss is None else total_lb_loss + lb_loss
         
         return x, total_lb_loss if return_load_balancer_loss else None
     
@@ -463,7 +463,7 @@ class MoETransformer(nn.Module):
         self,
         src: torch.Tensor,
         tgt: torch.Tensor,
-        return_load_balancer_loss: bool = None
+        return_load_balancer_loss: Optional[bool] = None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Forward pass through the model
@@ -494,13 +494,12 @@ class MoETransformer(nn.Module):
         logits = self.output_proj(decoder_output)
         
         # Combine load balancer losses
-        total_lb_loss = None
+        total_lb_loss : Optional[torch.Tensor] = None
         if return_load_balancer_loss:
-            total_lb_loss = 0
             if enc_lb_loss is not None:
-                total_lb_loss += enc_lb_loss
+                total_lb_loss = enc_lb_loss
             if dec_lb_loss is not None:
-                total_lb_loss += dec_lb_loss
+                total_lb_loss = dec_lb_loss if total_lb_loss is None else total_lb_loss + dec_lb_loss
         
         return logits, total_lb_loss
     
@@ -512,21 +511,34 @@ class MoETransformer(nn.Module):
         }
         
         for i, layer in enumerate(self.encoder_layers):
-            if hasattr(layer.ffn, 'get_expert_usage'):
-                usage_stats['encoder'].append(layer.ffn.get_expert_usage())
+            ffn = getattr(layer, "ffn", None)
+            if ffn is not None and hasattr(ffn, "get_expert_usage"):
+                method = getattr(ffn, "get_expert_usage", None)
+                if callable(method):
+                    usage_stats["encoder"].append(method())
+
         
         for i, layer in enumerate(self.decoder_layers):
-            if hasattr(layer.ffn, 'get_expert_usage'):
-                usage_stats['decoder'].append(layer.ffn.get_expert_usage())
+            ffn = getattr(layer, "ffn", None)
+            if ffn is not None and hasattr(ffn, "get_expert_usage"):
+                method = getattr(ffn, "get_expert_usage", None)
+                if callable(method):
+                    usage_stats['decoder'].append(method())
         
         return usage_stats
     
     def reset_expert_usage(self):
         """Reset expert usage tracking"""
         for layer in self.encoder_layers:
-            if hasattr(layer.ffn, 'reset_expert_usage'):
-                layer.ffn.reset_expert_usage()
+            ffn = getattr(layer, "ffn", None)
+            if ffn is not None and hasattr(ffn, "reset_expert_usage"):
+                method = getattr(ffn, "reset_expert_usage", None)
+                if callable(method):
+                    method()
         
         for layer in self.decoder_layers:
-            if hasattr(layer.ffn, 'reset_expert_usage'):
-                layer.ffn.reset_expert_usage()
+            ffn = getattr(layer, "ffn", None)
+            if ffn is not None and hasattr(ffn, "reset_expert_usage"):
+                method = getattr(ffn, "reset_expert_usage", None)
+                if callable(method):
+                    method()
