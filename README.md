@@ -1,5 +1,7 @@
 # Advanced NLP Assignment 3 - Mixture of Experts for Extreme Summarization
 
+Python: 3.12.12
+
 ## Project Overview
 Implementation of a Sparse Mixture-of-Experts (MoE) Transformer from scratch for the task of Extreme Summarization on the XSum dataset.
 

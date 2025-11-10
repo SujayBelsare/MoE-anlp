@@ -1,6 +1,7 @@
 """
 Comprehensive evaluation script for summarization models
 Includes lexical, embedding-based, and factual consistency metrics
+Configuration is loaded from config.yaml
 """
 
 import torch
@@ -12,7 +13,7 @@ from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
 import numpy as np
 import json
-import argparse
+import yaml
 from typing import List, Dict
 from tqdm import tqdm
 import pandas as pd
@@ -230,66 +231,7 @@ class SummarizationEvaluator:
                 'max': np.max(extractiveness_scores)
             }
         }
-    
-    def compute_summac(
-        self,
-        predictions: List[str],
-        documents: List[str],
-        batch_size: int = 8,
-        device: str = None
-    ) -> Dict:
-        """
-        Compute SummaC score for factual consistency
         
-        Args:
-            predictions: List of predicted summaries
-            documents: List of source documents
-            batch_size: Batch size for processing
-            device: Device to use
-            
-        Returns:
-            Dictionary with SummaC scores
-        """
-        print("Computing SummaC scores...")
-        
-        try:
-            from summac.model_summac import SummaCZS
-            
-            if device is None:
-                device = "cuda" if torch.cuda.is_available() else "cpu"
-            
-            # Initialize SummaC model
-            model = SummaCZS(
-                granularity="sentence",
-                model_name="vitc",
-                device=device
-            )
-            
-            consistency_scores = []
-            
-            for i in tqdm(range(0, len(predictions), batch_size)):
-                batch_preds = predictions[i:i+batch_size]
-                batch_docs = documents[i:i+batch_size]
-                
-                scores = model.score(batch_docs, batch_preds)
-                consistency_scores.extend(scores['scores'])
-            
-            return {
-                'summac': {
-                    'mean': np.mean(consistency_scores),
-                    'std': np.std(consistency_scores),
-                    'min': np.min(consistency_scores),
-                    'max': np.max(consistency_scores)
-                }
-            }
-        
-        except ImportError:
-            print("Warning: SummaC not installed. Skipping SummaC evaluation.")
-            return {'summac': 'not_available'}
-        except Exception as e:
-            print(f"Error computing SummaC: {e}")
-            return {'summac': f'error: {str(e)}'}
-    
     def human_evaluation_samples(
         self,
         predictions: List[str],
@@ -373,7 +315,6 @@ class SummarizationEvaluator:
         predictions: List[str],
         references: List[str],
         documents: List[str],
-        compute_summac: bool = True,
         human_eval_samples: int = 3
     ) -> Dict:
         """
@@ -383,7 +324,6 @@ class SummarizationEvaluator:
             predictions: List of predicted summaries
             references: List of reference summaries
             documents: List of source documents
-            compute_summac: Whether to compute SummaC (can be slow)
             human_eval_samples: Number of samples for human evaluation
             
         Returns:
@@ -405,10 +345,6 @@ class SummarizationEvaluator:
         results.update(self.compute_compression_ratio(predictions, documents))
         results.update(self.compute_extractiveness(predictions, documents))
         
-        # Factual consistency
-        if compute_summac:
-            print("\n=== FACTUAL CONSISTENCY (LLM-as-Judge) ===")
-            results.update(self.compute_summac(predictions, documents))
         
         # Human evaluation samples
         if human_eval_samples > 0:
@@ -468,13 +404,7 @@ def print_results(results: Dict, model_name: str):
         print("\n--- Extractiveness ---")
         print(f"Mean: {results['extractiveness']['mean']:.4f} ± {results['extractiveness']['std']:.4f}")
         print(f"Range: [{results['extractiveness']['min']:.4f}, {results['extractiveness']['max']:.4f}]")
-    
-    # SummaC
-    if 'summac' in results and isinstance(results['summac'], dict):
-        print("\n--- SummaC (Factual Consistency) ---")
-        print(f"Mean: {results['summac']['mean']:.4f} ± {results['summac']['std']:.4f}")
-        print(f"Range: [{results['summac']['min']:.4f}, {results['summac']['max']:.4f}]")
-    
+        
     print("\n" + "="*80)
 
 
@@ -486,7 +416,7 @@ def compare_models(results_dict: Dict[str, Dict]):
     
     # Create comparison table
     metrics = ['rouge1', 'rouge2', 'rougeL', 'bleu', 'bertscore', 
-               'compression_ratio', 'extractiveness', 'summac']
+               'compression_ratio', 'extractiveness']
     
     comparison_data = []
     
@@ -510,9 +440,6 @@ def compare_models(results_dict: Dict[str, Dict]):
         if 'extractiveness' in results:
             row['Extractiveness'] = f"{results['extractiveness']['mean']:.4f}"
         
-        if 'summac' in results and isinstance(results['summac'], dict):
-            row['SummaC'] = f"{results['summac']['mean']:.4f}"
-        
         comparison_data.append(row)
     
     # Print as DataFrame
@@ -524,25 +451,16 @@ def compare_models(results_dict: Dict[str, Dict]):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate summarization models")
-    parser.add_argument("--predictions", type=str, required=True,
-                       help="Path to predictions JSON file")
-    parser.add_argument("--model_name", type=str, default="model",
-                       help="Model name for display")
-    parser.add_argument("--output", type=str, default="evaluation_results.json",
-                       help="Output file for results")
-    parser.add_argument("--no_summac", action="store_true",
-                       help="Skip SummaC computation (can be slow)")
-    parser.add_argument("--human_eval_samples", type=int, default=3,
-                       help="Number of samples for human evaluation")
-    parser.add_argument("--compare_with", type=str, nargs='+',
-                       help="Additional prediction files to compare")
+    # Load configuration
+    import yaml
+    with open('config.yaml', 'r') as f:
+        config = yaml.safe_load(f)
     
-    args = parser.parse_args()
+    eval_config = config['scoring']
     
     # Load predictions
-    print(f"Loading predictions from {args.predictions}")
-    predictions, references, documents = load_predictions(args.predictions)
+    print(f"Loading predictions from {eval_config['predictions_file']}")
+    predictions, references, documents = load_predictions(eval_config['predictions_file'])
     
     print(f"Loaded {len(predictions)} predictions")
     
@@ -554,31 +472,30 @@ def main():
         predictions=predictions,
         references=references,
         documents=documents,
-        compute_summac=not args.no_summac,
-        human_eval_samples=args.human_eval_samples
+        human_eval_samples=eval_config['human_eval_samples']
     )
     
     # Print results
-    print_results(results, args.model_name)
+    print_results(results, eval_config['model_name'])
     
     # Save results
     # Remove human eval samples from saved results (they're just for display)
     results_to_save = {k: v for k, v in results.items() if k != 'human_eval_samples'}
     
-    with open(args.output, 'w') as f:
+    with open(eval_config['output_file'], 'w') as f:
         json.dump(results_to_save, f, indent=2)
     
-    print(f"\nResults saved to {args.output}")
+    print(f"\nResults saved to {eval_config['output_file']}")
     
     # Compare with other models if specified
-    if args.compare_with:
+    if eval_config['compare_with']:
         print("\n" + "="*80)
         print("LOADING ADDITIONAL MODELS FOR COMPARISON")
         print("="*80)
         
-        all_results = {args.model_name: results_to_save}
+        all_results = {eval_config['model_name']: results_to_save}
         
-        for comp_file in args.compare_with:
+        for comp_file in eval_config['compare_with']:
             comp_name = comp_file.split('/')[-1].replace('_predictions.json', '')
             print(f"\nEvaluating {comp_name}...")
             
@@ -587,7 +504,6 @@ def main():
                 predictions=comp_preds,
                 references=comp_refs,
                 documents=comp_docs,
-                compute_summac=not args.no_summac,
                 human_eval_samples=0  # Don't print samples for comparison models
             )
             
@@ -598,7 +514,7 @@ def main():
         comparison_df = compare_models(all_results)
         
         # Save comparison
-        comparison_output = args.output.replace('.json', '_comparison.csv')
+        comparison_output = eval_config['output_file'].replace('.json', '_comparison.csv')
         comparison_df.to_csv(comparison_output, index=False)
         print(f"\nComparison saved to {comparison_output}")
 

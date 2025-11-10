@@ -22,8 +22,8 @@ class XSumDataset(Dataset):
         self,
         split: str,
         tokenizer,
-        max_source_length: int = config.MAX_SOURCE_LENGTH,
-        max_target_length: int = config.MAX_TARGET_LENGTH,
+        max_source_length: Optional[int] = config['dataset']['max_source_length'],
+        max_target_length: Optional[int] = config['dataset']['max_target_length'],
         num_samples: Optional[int] = None
     ):
         """
@@ -107,9 +107,9 @@ class XSumDataModule:
     def __init__(
         self,
         tokenizer_name: str,
-        batch_size: int = None,
-        max_source_length: int = None,
-        max_target_length: int = None,
+        batch_size: Optional[int] = None,
+        max_source_length: Optional[int] = None,
+        max_target_length: Optional[int] = None,
         num_workers: int = 4,
         train_samples: Optional[int] = None,
         val_samples: Optional[int] = None,

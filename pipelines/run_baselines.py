@@ -17,14 +17,14 @@ from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_tr
 import os
 from tqdm import tqdm
 import json
-from config import load_config, DEFAULT_CONFIG as config
+from configs import load_config, DEFAULT_CONFIG as config
 from utils import set_seed, ensure_dir
-
+from typing import Optional
 
 class BARTInference:
     """Run inference with pre-trained BART model"""
     
-    def __init__(self, model_name: str = config.BART_MODEL, device: str = None):
+    def __init__(self, model_name: str = config['baseline_models']['bart'], device: Optional[str] = None):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Loading BART model: {model_name}")
         
@@ -36,9 +36,9 @@ class BARTInference:
     def generate_summaries(
         self,
         documents,
-        max_length: int = config.MAX_TARGET_LENGTH,
-        num_beams: int = config.NUM_BEAMS,
-        batch_size: int = 8
+        max_length: int = config['dataset']['max_target_length'],
+        num_beams: int = config['evaluation']['num_beams'],
+        batch_size: int = 128
     ):
         """Generate summaries for a list of documents"""
         summaries = []
@@ -48,7 +48,7 @@ class BARTInference:
             
             inputs = self.tokenizer(
                 batch_docs,
-                max_length=config.MAX_SOURCE_LENGTH,
+                max_length=config['dataset']['max_source_length'],
                 truncation=True,
                 padding=True,
                 return_tensors="pt"
@@ -58,8 +58,8 @@ class BARTInference:
                 **inputs,
                 max_length=max_length,
                 num_beams=num_beams,
-                length_penalty=config.LENGTH_PENALTY,
-                early_stopping=config.EARLY_STOPPING
+                length_penalty=config['evaluation']['length_penalty'],
+                early_stopping=config['evaluation']['early_stopping']
             )
             
             batch_summaries = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
@@ -70,7 +70,7 @@ class BARTInference:
     def run_on_test_set(self, output_path: str = "outputs/bart_predictions.json"):
         """Run inference on XSum test set"""
         print("Loading XSum test set...")
-        dataset = load_dataset(config.DATASET_NAME, split="test")
+        dataset = load_dataset(config['dataset']['name'], split="test")
         
         documents = dataset['document']
         references = dataset['summary']
@@ -153,9 +153,9 @@ class EncoderDecoderFineTuner:
         
         return model
     
-    def prepare_dataset(self, split: str, num_samples: int = None):
+    def prepare_dataset(self, split: str, num_samples: Optional[int] = None):
         """Prepare dataset for training/evaluation"""
-        dataset = load_dataset(config.DATASET_NAME, split=split)
+        dataset = load_dataset(config['dataset']['name'], split=split)
         
         if num_samples:
             dataset = dataset.select(range(min(num_samples, len(dataset))))
@@ -163,14 +163,14 @@ class EncoderDecoderFineTuner:
         def preprocess(examples):
             inputs = self.tokenizer(
                 examples['document'],
-                max_length=config.MAX_SOURCE_LENGTH,
+                max_length=config['dataset']['max_source_length'],
                 truncation=True,
                 padding=False
             )
             
             targets = self.tokenizer(
                 examples['summary'],
-                max_length=config.MAX_TARGET_LENGTH,
+                max_length=config['dataset']['max_target_length'],
                 truncation=True,
                 padding=False
             )
@@ -223,8 +223,8 @@ class EncoderDecoderFineTuner:
             save_strategy="epoch",
             load_best_model_at_end=True,
             predict_with_generate=True,
-            generation_max_length=config.MAX_TARGET_LENGTH,
-            generation_num_beams=config.NUM_BEAMS,
+            generation_max_length=config['dataset']['max_target_length'],
+            generation_num_beams=config['evaluation']['num_beams'],
             push_to_hub=push_to_hub,
             report_to="wandb" if not os.getenv("NO_WANDB") else "none"
         )
@@ -253,7 +253,7 @@ class EncoderDecoderFineTuner:
         self,
         documents,
         batch_size: int = 8,
-        max_length: int = config.MAX_TARGET_LENGTH
+        max_length: int = config['dataset']['max_target_length']
     ):
         """Run inference on documents"""
         self.model.eval()
@@ -264,7 +264,7 @@ class EncoderDecoderFineTuner:
             
             inputs = self.tokenizer(
                 batch_docs,
-                max_length=config.MAX_SOURCE_LENGTH,
+                max_length=config['dataset']['max_source_length'],
                 truncation=True,
                 padding=True,
                 return_tensors="pt"
@@ -274,9 +274,9 @@ class EncoderDecoderFineTuner:
                 outputs = self.model.generate(
                     **inputs,
                     max_length=max_length,
-                    num_beams=config.NUM_BEAMS,
-                    length_penalty=config.LENGTH_PENALTY,
-                    early_stopping=config.EARLY_STOPPING
+                    num_beams=config['evaluation']['num_beams'],
+                    length_penalty=config['evaluation']['length_penalty'],
+                    early_stopping=config['evaluation']['early_stopping']
                 )
             
             batch_summaries = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
@@ -293,7 +293,7 @@ class InstructionTuner:
         model_name: str,
         use_peft: bool = True,
         use_4bit: bool = True,
-        device: str = None
+        device: Optional[str] = None
     ):
         self.model_name = model_name
         self.use_peft = use_peft
@@ -364,7 +364,7 @@ class InstructionTuner:
     
     def prepare_dataset(self, split: str, num_samples: int = None):
         """Prepare dataset for instruction tuning"""
-        dataset = load_dataset(config.DATASET_NAME, split=split)
+        dataset = load_dataset(config['dataset']['name'], split=split)
         
         if num_samples:
             dataset = dataset.select(range(min(num_samples, len(dataset))))
@@ -376,7 +376,7 @@ class InstructionTuner:
             
             tokenized = self.tokenizer(
                 prompts,
-                max_length=config.MAX_SOURCE_LENGTH + config.MAX_TARGET_LENGTH,
+                max_length=config['dataset']['max_source_length'] + config['dataset']['max_target_length'],
                 truncation=True,
                 padding=False
             )
@@ -460,7 +460,7 @@ class InstructionTuner:
         self,
         documents,
         batch_size: int = 4,
-        max_new_tokens: int = config.MAX_TARGET_LENGTH
+        max_new_tokens: int = config['dataset']['max_target_length']
     ):
         """Generate summaries"""
         self.model.eval()
@@ -472,7 +472,7 @@ class InstructionTuner:
             
             inputs = self.tokenizer(
                 prompts,
-                max_length=config.MAX_SOURCE_LENGTH,
+                max_length=config['dataset']['max_source_length'],
                 truncation=True,
                 padding=True,
                 return_tensors="pt"
@@ -482,7 +482,7 @@ class InstructionTuner:
                 outputs = self.model.generate(
                     **inputs,
                     max_new_tokens=max_new_tokens,
-                    num_beams=config.NUM_BEAMS,
+                    num_beams=config['evaluation']['num_beams'],
                     temperature=0.7,
                     do_sample=False,
                     pad_token_id=self.tokenizer.pad_token_id,
@@ -510,45 +510,45 @@ def main():
     set_seed(config["training"]["seed"])
     
     # Debug mode
-    if config["mode"]["debug"]:
-        config["dataset"]["train_samples"] = 100
-        config["dataset"]["val_samples"] = 50
-        config["training"]["epochs"] = 1
+    if config["debug"]["enabled"]:
+        config["debug"]["train_samples"] = 100
+        config["debug"]["val_samples"] = 50
+        config["debug"]["num_epochs"] = 1
         print("DEBUG MODE: Using small dataset")
     
     # Run task
-    if config["mode"]["task"] == "bart_inference":
+    if config["baseline"]["task"] == "bart_inference":
         print("Running BART inference...")
         bart = BARTInference()
         predictions, references = bart.run_on_test_set(
-            output_path=f"{config['paths']['outputs']}/bart_predictions.json"
+            output_path=f"{config['paths']['output_dir']}/bart_predictions.json"
         )
         print(f"Generated {len(predictions)} summaries")
     
-    elif config["mode"]["task"] == "finetune":
+    elif config["baseline"]["task"] == "finetune":
         model = config["model"].get("name", "google-t5/t5-base")
         print(f"Fine-tuning {model}...")
         finetuner = EncoderDecoderFineTuner(
             model_name=model,
-            use_peft=config["training"]["use_peft"],
-            use_8bit=config["training"].get("use_quantization", False)
+            use_peft=config["baseline"]["finetune"]["use_peft"],
+            use_8bit=config["baseline"]["finetune"]["use_quantization"]
         )
         
-        output_dir = f"{config['paths']['outputs']}/finetuned_{model.split('/')[-1]}"
+        output_dir = f"{config['paths']['output_dir']}/finetuned_{model.split('/')[-1]}"
         
         trainer = finetuner.train(
             output_dir=output_dir,
-            num_epochs=config["training"]["epochs"],
-            batch_size=config["training"]["batch_size"],
-            learning_rate=config["training"]["learning_rate"],
-            train_samples=config["dataset"]["train_samples"],
-            val_samples=config["dataset"]["val_samples"],
+            num_epochs=config["baseline"]["finetune"]["num_epochs"],
+            batch_size=config["baseline"]["finetune"]["batch_size"],
+            learning_rate=config["baseline"]["finetune"]["learning_rate"],
+            train_samples=config["baseline"]["finetune"]["train_samples"],
+            val_samples=config["baseline"]["finetune"]["val_samples"],
             push_to_hub=config["huggingface"]["push_to_hub"]
         )
         
         # Run inference on test set
         print("Running inference on test set...")
-        test_dataset = load_dataset(config.DATASET_NAME, split="test")
+        test_dataset = load_dataset(config['dataset']['name'], split="test")
         predictions = finetuner.inference(test_dataset['document'])
         
         results = {
@@ -562,31 +562,31 @@ def main():
             json.dump(results, f, indent=2)
         print(f"Results saved to {result_path}")
     
-    elif config["mode"]["task"] == "instruction_tune":
+    elif config["baseline"]["task"] == "instruction_tune":
         model = config["model"].get("name", "meta-llama/Llama-3.2-1B-Instruct")
         
         print(f"Instruction tuning {model}...")
         tuner = InstructionTuner(
             model_name=model,
-            use_peft=config["training"]["use_peft"],
-            use_4bit=config["training"].get("use_quantization", False)
+            use_peft=config["baseline"]["finetune"]["use_peft"],
+            use_4bit=config["baseline"]["finetune"]["use_quantization"]
         )
         
-        output_dir = f"{config['paths']['outputs']}/instruction_tuned_{model.split('/')[-1]}"
+        output_dir = f"{config['paths']['output_dir']}/instruction_tuned_{model.split('/')[-1]}"
         
         trainer = tuner.train(
             output_dir=output_dir,
-            num_epochs=config["training"]["epochs"],
-            batch_size=config["training"]["batch_size"],
-            learning_rate=config["training"]["learning_rate"],
-            train_samples=config["dataset"]["train_samples"],
-            val_samples=config["dataset"]["val_samples"],
+            num_epochs=config["baseline"]["finetune"]["num_epochs"],
+            batch_size=config["baseline"]["finetune"]["batch_size"],
+            learning_rate=config["baseline"]["finetune"]["learning_rate"],
+            train_samples=config["baseline"]["finetune"]["train_samples"],
+            val_samples=config["baseline"]["finetune"]["val_samples"],
             push_to_hub=config["huggingface"]["push_to_hub"]
         )
         
         # Run inference on test set
         print("Running inference on test set...")
-        test_dataset = load_dataset(config.DATASET_NAME, split="test")
+        test_dataset = load_dataset(config['dataset']['name'], split="test")
         predictions = tuner.inference(test_dataset['document'])
         
         results = {

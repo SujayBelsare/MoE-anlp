@@ -1,5 +1,5 @@
 # Mode configuration
-mode: train  # One of: baseline, train, evaluate
+mode: baseline  # One of: baseline, train, evaluate
 
 # Dataset configuration
 dataset:
@@ -26,6 +26,7 @@ moe:
 
 # Training configuration
 training:
+  seed: 2023101033
   batch_size: 16
   learning_rate: 5e-5
   num_epochs: 10
@@ -57,8 +58,8 @@ paths:
 
 # HuggingFace Hub
 huggingface:
-  username: your-username  # Update with your HF username
-  push_to_hub: false      # Whether to push models to HuggingFace Hub
+  username:  sujay-belsare
+  push_to_hub: false  # Whether to push models to HuggingFace Hub
 
 # Weights & Biases configuration
 wandb:
@@ -90,3 +91,22 @@ evaluation:
   num_beams: 4
   length_penalty: 2.0
   early_stopping: true
+
+baseline:
+  task: "bart_inference" # Choose from: bart_inference, finetune, instruction_tune
+  finetune:
+    use_peft: false
+    use_quantization: true
+    num_epochs: 10
+    batch_size: 16
+    learning_rate: 5e-5
+    train_samples: null
+    val_samples: null
+
+
+scoring:
+  predictions_file: "outputs/bart_predictions.json"  # Path to predictions JSON file
+  model_name: "bart"  # Model name for display
+  output_file: "bart_evaluation_results.json"  # Output file for results
+  human_eval_samples: 3  # Number of samples for human evaluation
+  compare_with: []  # Additional prediction files to compare with
