@@ -1,274 +1,214 @@
-"""
-Data loading and preprocessing for XSum dataset
-"""
-
 import torch
 from torch.utils.data import Dataset, DataLoader
 from datasets import load_dataset
-from transformers import AutoTokenizer
-from typing import Dict, List, Optional
-from configs import load_config
-
-# Load default configuration
-config = load_config()
+from transformers import PreTrainedTokenizer
+from typing import Dict, Optional
 
 
 class XSumDataset(Dataset):
-    """
-    PyTorch Dataset for XSum extreme summarization task.
-    """
+    """XSum dataset for extreme summarization"""
     
     def __init__(
         self,
         split: str,
-        tokenizer,
-        max_source_length: Optional[int] = config['dataset']['max_source_length'],
-        max_target_length: Optional[int] = config['dataset']['max_target_length'],
-        num_samples: Optional[int] = None
+        tokenizer: PreTrainedTokenizer,
+        max_input_length: int = 512,
+        max_target_length: int = 64,
+        num_samples: Optional[int] = None,
     ):
         """
         Args:
-            split: Dataset split ('train', 'validation', 'test')
-            tokenizer: Tokenizer instance
-            max_source_length: Maximum length for source documents
-            max_target_length: Maximum length for target summaries
-            num_samples: Optional limit on number of samples (for debugging)
+            split: 'train', 'validation', or 'test'
+            tokenizer: Tokenizer to use
+            max_input_length: Maximum input sequence length
+            max_target_length: Maximum target sequence length
+            num_samples: Number of samples to load (None for all)
         """
-        self.split = split
         self.tokenizer = tokenizer
-        self.max_source_length = max_source_length
+        self.max_input_length = max_input_length
         self.max_target_length = max_target_length
         
-        # Load dataset from HuggingFace
-        print(f"Loading XSum dataset split: {split}")
-        self.dataset = load_dataset(config['dataset']['name'], split=split)
+        # Load dataset
+        print(f"Loading {split} split of XSum dataset...")
+        self.dataset = load_dataset("EdinburghNLP/xsum", split=split)
         
-        # Optionally limit dataset size
         if num_samples is not None:
             self.dataset = self.dataset.select(range(min(num_samples, len(self.dataset))))
         
         print(f"Loaded {len(self.dataset)} samples")
-        
+    
     def __len__(self) -> int:
         return len(self.dataset)
     
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """
-        Get a single sample from the dataset.
+        item = self.dataset[idx]
         
-        Returns:
-            Dictionary containing:
-                - input_ids: Tokenized source document
-                - attention_mask: Attention mask for source
-                - labels: Tokenized target summary
-                - decoder_attention_mask: Attention mask for target
-        """
-        sample = self.dataset[idx]
-        
-        # Get document and summary
-        document = sample['document']
-        summary = sample['summary']
-        
-        # Tokenize source document
-        source_encoding = self.tokenizer(
-            document,
-            max_length=self.max_source_length,
+        # Tokenize document
+        document_encoding = self.tokenizer(
+            item['document'],
+            max_length=self.max_input_length,
             padding='max_length',
             truncation=True,
             return_tensors='pt'
         )
         
-        # Tokenize target summary
-        target_encoding = self.tokenizer(
-            summary,
+        # Tokenize summary
+        summary_encoding = self.tokenizer(
+            item['summary'],
             max_length=self.max_target_length,
             padding='max_length',
             truncation=True,
             return_tensors='pt'
         )
         
-        # Prepare labels (replace padding token id with -100 for loss calculation)
-        labels = target_encoding['input_ids'].squeeze()
-        labels[labels == self.tokenizer.pad_token_id] = -100
-        
         return {
-            'input_ids': source_encoding['input_ids'].squeeze(),
-            'attention_mask': source_encoding['attention_mask'].squeeze(),
-            'labels': labels,
-            'decoder_attention_mask': target_encoding['attention_mask'].squeeze()
+            'input_ids': document_encoding['input_ids'].squeeze(0),
+            'attention_mask': document_encoding['attention_mask'].squeeze(0),
+            'labels': summary_encoding['input_ids'].squeeze(0),
+            'decoder_attention_mask': summary_encoding['attention_mask'].squeeze(0),
+            'document': item['document'],
+            'summary': item['summary'],
         }
 
 
-class XSumDataModule:
-    """
-    Data module that handles dataset creation and dataloader initialization.
-    """
-    
-    def __init__(
-        self,
-        tokenizer_name: str,
-        batch_size: Optional[int] = None,
-        max_source_length: Optional[int] = None,
-        max_target_length: Optional[int] = None,
-        num_workers: int = 4,
-        train_samples: Optional[int] = None,
-        val_samples: Optional[int] = None,
-        test_samples: Optional[int] = None
-    ):
-        # Use config defaults if not provided
-        self.batch_size = batch_size or config['training']['batch_size']
-        self.max_source_length = max_source_length or config['dataset']['max_source_length']
-        self.max_target_length = max_target_length or config['dataset']['max_target_length']
-        """
-        Args:
-            tokenizer_name: Name or path of tokenizer
-            batch_size: Batch size for dataloaders
-            max_source_length: Maximum source document length
-            max_target_length: Maximum target summary length
-            num_workers: Number of dataloader workers
-            train_samples: Optional limit on training samples
-            val_samples: Optional limit on validation samples
-            test_samples: Optional limit on test samples
-        """
-        self.tokenizer_name = tokenizer_name
-        self.batch_size = batch_size
-        self.max_source_length = max_source_length
-        self.max_target_length = max_target_length
-        self.num_workers = num_workers
-        
-        # Initialize tokenizer
-        print(f"Loading tokenizer: {tokenizer_name}")
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-        
-        # Ensure tokenizer has pad token
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-        
-        # Create datasets
-        self.train_dataset = XSumDataset(
-            'train',
-            self.tokenizer,
-            max_source_length,
-            max_target_length,
-            train_samples
-        )
-        
-        self.val_dataset = XSumDataset(
-            'validation',
-            self.tokenizer,
-            max_source_length,
-            max_target_length,
-            val_samples
-        )
-        
-        self.test_dataset = XSumDataset(
-            'test',
-            self.tokenizer,
-            max_source_length,
-            max_target_length,
-            test_samples
-        )
-    
-    def train_dataloader(self, shuffle: bool = True) -> DataLoader:
-        """Create training dataloader"""
-        return DataLoader(
-            self.train_dataset,
-            batch_size=self.batch_size,
-            shuffle=shuffle,
-            num_workers=self.num_workers,
-            pin_memory=True
-        )
-    
-    def val_dataloader(self) -> DataLoader:
-        """Create validation dataloader"""
-        return DataLoader(
-            self.val_dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-            pin_memory=True
-        )
-    
-    def test_dataloader(self) -> DataLoader:
-        """Create test dataloader"""
-        return DataLoader(
-            self.test_dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-            pin_memory=True
-        )
-    
-    def get_tokenizer(self):
-        """Get the tokenizer instance"""
-        return self.tokenizer
-
-
 def get_data_loader(
-    tokenizer,
+    tokenizer: PreTrainedTokenizer,
+    batch_size: int,
     split: str,
-    batch_size: int = None,
-    max_source_length: int = None,
-    max_target_length: int = None,
-    shuffle: bool = None,
+    max_input_length: int = 512,
+    max_target_length: int = 64,
+    num_samples: Optional[int] = None,
     num_workers: int = 4,
-    num_samples: Optional[int] = None
+    shuffle: bool = None,
 ) -> DataLoader:
-    # Use config defaults if not provided
-    batch_size = batch_size or config['training']['batch_size']
-    max_source_length = max_source_length or config['dataset']['max_source_length']
-    max_target_length = max_target_length or config['dataset']['max_target_length']
     """
-    Factory function to create a dataloader for a specific split.
+    Factory function to create a DataLoader for XSum dataset
     
     Args:
-        tokenizer: Tokenizer instance
-        split: Dataset split ('train', 'validation', 'test')
+        tokenizer: Tokenizer to use
         batch_size: Batch size
-        max_source_length: Maximum source length
-        max_target_length: Maximum target length
-        shuffle: Whether to shuffle (default: True for train, False for val/test)
-        num_workers: Number of dataloader workers
-        num_samples: Optional limit on number of samples
-        
+        split: 'train', 'validation', or 'test'
+        max_input_length: Maximum input sequence length
+        max_target_length: Maximum target sequence length
+        num_samples: Number of samples to load
+        num_workers: Number of worker processes
+        shuffle: Whether to shuffle (None = auto based on split)
+    
     Returns:
         DataLoader instance
     """
-    if shuffle is None:
-        shuffle = (split == 'train')
-    
     dataset = XSumDataset(
         split=split,
         tokenizer=tokenizer,
-        max_source_length=max_source_length,
+        max_input_length=max_input_length,
         max_target_length=max_target_length,
-        num_samples=num_samples
+        num_samples=num_samples,
     )
+    
+    if shuffle is None:
+        shuffle = (split == 'train')
     
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=True,
     )
 
 
-# Collate function for variable length sequences
-def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
-    """
-    Custom collate function for batching.
+class InstructDataset(Dataset):
+    """Dataset wrapper for instruction-tuning format"""
     
-    Args:
-        batch: List of samples
+    def __init__(
+        self,
+        split: str,
+        tokenizer: PreTrainedTokenizer,
+        max_length: int = 512,
+        num_samples: Optional[int] = None,
+    ):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
         
-    Returns:
-        Batched dictionary
-    """
-    # Stack all tensors
-    return {
-        'input_ids': torch.stack([item['input_ids'] for item in batch]),
-        'attention_mask': torch.stack([item['attention_mask'] for item in batch]),
-        'labels': torch.stack([item['labels'] for item in batch]),
-        'decoder_attention_mask': torch.stack([item['decoder_attention_mask'] for item in batch])
-    }
+        # Load dataset
+        print(f"Loading {split} split for instruction tuning...")
+        self.dataset = load_dataset("EdinburghNLP/xsum", split=split)
+        
+        if num_samples is not None:
+            self.dataset = self.dataset.select(range(min(num_samples, len(self.dataset))))
+        
+        print(f"Loaded {len(self.dataset)} samples")
+        
+        # Instruction template
+        self.instruction = (
+            "Summarize the following news article in one sentence:\n\n"
+            "{document}\n\nSummary:"
+        )
+    
+    def __len__(self) -> int:
+        return len(self.dataset)
+    
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        item = self.dataset[idx]
+        
+        # Format as instruction
+        prompt = self.instruction.format(document=item['document'])
+        full_text = prompt + " " + item['summary']
+        
+        # Tokenize
+        encoding = self.tokenizer(
+            full_text,
+            max_length=self.max_length,
+            padding='max_length',
+            truncation=True,
+            return_tensors='pt'
+        )
+        
+        # Create labels (mask the prompt part)
+        prompt_encoding = self.tokenizer(
+            prompt,
+            max_length=self.max_length,
+            truncation=True,
+            return_tensors='pt'
+        )
+        prompt_len = prompt_encoding['input_ids'].shape[1]
+        
+        labels = encoding['input_ids'].clone()
+        labels[0, :prompt_len] = -100  # Ignore prompt in loss
+        
+        return {
+            'input_ids': encoding['input_ids'].squeeze(0),
+            'attention_mask': encoding['attention_mask'].squeeze(0),
+            'labels': labels.squeeze(0),
+            'document': item['document'],
+            'summary': item['summary'],
+        }
+
+
+def get_instruct_data_loader(
+    tokenizer: PreTrainedTokenizer,
+    batch_size: int,
+    split: str,
+    max_length: int = 512,
+    num_samples: Optional[int] = None,
+    num_workers: int = 4,
+    shuffle: bool = None,
+) -> DataLoader:
+    """Create DataLoader for instruction-tuning"""
+    dataset = InstructDataset(
+        split=split,
+        tokenizer=tokenizer,
+        max_length=max_length,
+        num_samples=num_samples,
+    )
+    
+    if shuffle is None:
+        shuffle = (split == 'train')
+    
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=True,
+    )

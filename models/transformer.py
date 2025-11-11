@@ -1,544 +1,314 @@
-"""
-Transformer architecture with Mixture of Experts layers
-"""
-
 import torch
 import torch.nn as nn
 import math
 from typing import Optional, Tuple
-from models.moe_layer import SparseMoELayer
-from configs import load_config
-
-# Load default configuration
-config = load_config()
+from .moe_layer import SparseMoELayer
 
 
 class PositionalEncoding(nn.Module):
     """Sinusoidal positional encoding"""
     
-    def __init__(self, d_model: int, max_len: int = 5000):
+    def __init__(self, d_model: int, max_len: int = 5000, dropout: float = 0.1):
         super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
         
-        # Create positional encoding matrix
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        
-        self.register_buffer('pe', pe.unsqueeze(0))
-        self.pe: torch.Tensor
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(1, max_len, d_model)
+        pe[0, :, 0::2] = torch.sin(position * div_term)
+        pe[0, :, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: Tensor of shape (batch_size, seq_len, d_model)
-        Returns:
-            Tensor with positional encoding added
-        """
-        return x + self.pe[:, :x.size(1), :]
+        x = x + self.pe[:, :x.size(1), :]
+        return self.dropout(x)
 
 
-class MultiHeadAttention(nn.Module):
-    """Multi-head attention mechanism"""
-    
-    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
-        super().__init__()
-        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
-        
-        self.d_model = d_model
-        self.n_heads = n_heads
-        self.d_k = d_model // n_heads
-        
-        # Linear projections
-        self.q_linear = nn.Linear(d_model, d_model)
-        self.k_linear = nn.Linear(d_model, d_model)
-        self.v_linear = nn.Linear(d_model, d_model)
-        self.out_linear = nn.Linear(d_model, d_model)
-        
-        self.dropout = nn.Dropout(dropout)
-        
-    def forward(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """
-        Args:
-            query: (batch_size, seq_len, d_model)
-            key: (batch_size, seq_len, d_model)
-            value: (batch_size, seq_len, d_model)
-            mask: Optional attention mask
-        Returns:
-            Output tensor of shape (batch_size, seq_len, d_model)
-        """
-        batch_size = query.size(0)
-        
-        # Linear projections and reshape for multi-head
-        Q = self.q_linear(query).view(batch_size, -1, self.n_heads, self.d_k).transpose(1, 2)
-        K = self.k_linear(key).view(batch_size, -1, self.n_heads, self.d_k).transpose(1, 2)
-        V = self.v_linear(value).view(batch_size, -1, self.n_heads, self.d_k).transpose(1, 2)
-        
-        # Scaled dot-product attention
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
-        
-        if mask is not None:
-            scores = scores.masked_fill(mask == 0, -1e9)
-        
-        attention_weights = torch.softmax(scores, dim=-1)
-        attention_weights = self.dropout(attention_weights)
-        
-        # Apply attention to values
-        context = torch.matmul(attention_weights, V)
-        
-        # Concatenate heads
-        context = context.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
-        
-        # Final linear projection
-        output = self.out_linear(context)
-        
-        return output
-
-
-class TransformerEncoderLayer(nn.Module):
-    """Single Transformer encoder layer with MoE"""
+class TransformerEncoderLayerWithMoE(nn.Module):
+    """Transformer encoder layer with MoE replacing FFN"""
     
     def __init__(
         self,
         d_model: int,
-        n_heads: int,
-        d_ff: int,
+        nhead: int,
         num_experts: int,
+        expert_hidden_dim: int,
         top_k: int,
-        router,
-        load_balancer=None,
-        use_load_balancer_loss: bool = False,
+        router_type: str = "top_k",
         dropout: float = 0.1,
-        use_moe: bool = True
+        use_load_balancer: bool = False,
     ):
         super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.moe = SparseMoELayer(
+            d_model, num_experts, expert_hidden_dim, top_k, 
+            router_type, dropout, use_load_balancer
+        )
         
-        self.use_moe = use_moe
-        self.use_load_balancer_loss = use_load_balancer_loss
-        
-        # Self-attention
-        self.self_attn = MultiHeadAttention(d_model, n_heads, dropout)
-        
-        # Feed-forward or MoE
-        if use_moe:
-            self.ffn = SparseMoELayer(
-                d_model, d_ff, num_experts, top_k, router, load_balancer, dropout,
-                use_load_balancer_loss
-            )
-        else:
-            self.ffn = nn.Sequential(
-                nn.Linear(d_model, d_ff),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(d_ff, d_model),
-                nn.Dropout(dropout)
-            )
-        
-        # Layer normalization
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
-        
         self.dropout = nn.Dropout(dropout)
-        
+    
     def forward(
-        self,
-        x: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-        return_load_balancer_loss: bool = False
+        self, 
+        src: torch.Tensor, 
+        src_mask: Optional[torch.Tensor] = None,
+        src_key_padding_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Args:
-            x: Input tensor of shape (batch_size, seq_len, d_model)
-            mask: Optional attention mask
-            return_load_balancer_loss: Whether to return load balancer loss
-        Returns:
-            output: Output tensor
-            load_balancer_loss: Optional load balancer loss
-        """
-        # Self-attention with residual connection
-        attn_output = self.self_attn(x, x, x, mask)
-        x = self.norm1(x + self.dropout(attn_output))
+        # Self attention
+        src2, _ = self.self_attn(src, src, src, attn_mask=src_mask, 
+                                  key_padding_mask=src_key_padding_mask)
+        src = src + self.dropout(src2)
+        src = self.norm1(src)
         
-        # Feed-forward or MoE with residual connection
-        if self.use_moe:
-            ffn_output, lb_loss = self.ffn(x, return_load_balancer_loss)
-        else:
-            ffn_output = self.ffn(x)
-            lb_loss = None
+        # MoE
+        src2, aux_loss = self.moe(src)
+        src = src + self.dropout(src2)
+        src = self.norm2(src)
         
-        x = self.norm2(x + self.dropout(ffn_output))
-        
-        return x, lb_loss
+        return src, aux_loss
 
 
-class TransformerDecoderLayer(nn.Module):
-    """Single Transformer decoder layer with MoE"""
+class TransformerDecoderLayerWithMoE(nn.Module):
+    """Transformer decoder layer with MoE replacing FFN"""
     
     def __init__(
         self,
         d_model: int,
-        n_heads: int,
-        d_ff: int,
+        nhead: int,
         num_experts: int,
+        expert_hidden_dim: int,
         top_k: int,
-        router,
-        load_balancer=None,
-        use_load_balancer_loss: bool = False,
+        router_type: str = "top_k",
         dropout: float = 0.1,
-        use_moe: bool = True
+        use_load_balancer: bool = False,
     ):
         super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.moe = SparseMoELayer(
+            d_model, num_experts, expert_hidden_dim, top_k,
+            router_type, dropout, use_load_balancer
+        )
         
-        self.use_moe = use_moe
-        self.use_load_balancer_loss = use_load_balancer_loss
-        
-        # Self-attention
-        self.self_attn = MultiHeadAttention(d_model, n_heads, dropout)
-        
-        # Cross-attention
-        self.cross_attn = MultiHeadAttention(d_model, n_heads, dropout)
-        
-        # Feed-forward or MoE
-        if use_moe:
-            self.ffn = SparseMoELayer(
-                d_model, d_ff, num_experts, top_k, router, load_balancer, dropout,
-                use_load_balancer_loss
-            )
-        else:
-            self.ffn = nn.Sequential(
-                nn.Linear(d_model, d_ff),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(d_ff, d_model),
-                nn.Dropout(dropout)
-            )
-        
-        # Layer normalization
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.norm3 = nn.LayerNorm(d_model)
-        
         self.dropout = nn.Dropout(dropout)
-        
+    
     def forward(
         self,
-        x: torch.Tensor,
-        encoder_output: torch.Tensor,
-        src_mask: Optional[torch.Tensor] = None,
+        tgt: torch.Tensor,
+        memory: torch.Tensor,
         tgt_mask: Optional[torch.Tensor] = None,
-        return_load_balancer_loss: bool = False
+        memory_mask: Optional[torch.Tensor] = None,
+        tgt_key_padding_mask: Optional[torch.Tensor] = None,
+        memory_key_padding_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Args:
-            x: Input tensor of shape (batch_size, tgt_seq_len, d_model)
-            encoder_output: Encoder output of shape (batch_size, src_seq_len, d_model)
-            src_mask: Optional source mask
-            tgt_mask: Optional target mask
-            return_load_balancer_loss: Whether to return load balancer loss
-        Returns:
-            output: Output tensor
-            load_balancer_loss: Optional load balancer loss
-        """
-        # Self-attention
-        self_attn_output = self.self_attn(x, x, x, tgt_mask)
-        x = self.norm1(x + self.dropout(self_attn_output))
+        # Self attention
+        tgt2, _ = self.self_attn(tgt, tgt, tgt, attn_mask=tgt_mask,
+                                  key_padding_mask=tgt_key_padding_mask)
+        tgt = tgt + self.dropout(tgt2)
+        tgt = self.norm1(tgt)
         
-        # Cross-attention
-        cross_attn_output = self.cross_attn(x, encoder_output, encoder_output, src_mask)
-        x = self.norm2(x + self.dropout(cross_attn_output))
+        # Cross attention
+        tgt2, _ = self.cross_attn(tgt, memory, memory, attn_mask=memory_mask,
+                                   key_padding_mask=memory_key_padding_mask)
+        tgt = tgt + self.dropout(tgt2)
+        tgt = self.norm2(tgt)
         
-        # Feed-forward or MoE
-        if self.use_moe:
-            ffn_output, lb_loss = self.ffn(x, return_load_balancer_loss)
-        else:
-            ffn_output = self.ffn(x)
-            lb_loss = None
+        # MoE
+        tgt2, aux_loss = self.moe(tgt)
+        tgt = tgt + self.dropout(tgt2)
+        tgt = self.norm3(tgt)
         
-        x = self.norm3(x + self.dropout(ffn_output))
-        
-        return x, lb_loss
+        return tgt, aux_loss
 
 
 class MoETransformer(nn.Module):
-    """
-    Complete Transformer model with Mixture of Experts layers
-    for sequence-to-sequence tasks (e.g., summarization)
-    """
+    """Full Encoder-Decoder Transformer with MoE layers"""
     
     def __init__(
         self,
         vocab_size: int,
-        d_model: Optional[int] = None,
-        n_heads: Optional[int] = None,
-        n_layers: Optional[int] = None,
-        d_ff: Optional[int] = None,
-        num_experts: Optional[int] = None,
-        top_k: Optional[int] = None,
-        router_type: str = "topk",  # "topk" or "hash"
-        load_balancer_weight: Optional[float] = None,
-        use_load_balancer_loss: bool = False,
-        dropout_rate: Optional[float] = None,
-        max_len: int = 5000,
-        pad_token_id: int = 0,
-        use_moe_encoder: bool = True,
-        use_moe_decoder: bool = True
+        d_model: int = 512,
+        nhead: int = 8,
+        num_encoder_layers: int = 6,
+        num_decoder_layers: int = 6,
+        num_experts: int = 8,
+        expert_hidden_dim: int = 2048,
+        top_k: int = 2,
+        router_type: str = "top_k",
+        dropout: float = 0.1,
+        max_seq_length: int = 512,
+        use_load_balancer: bool = False,
+        pad_token_id: int = 1,
     ):
-        # Use config defaults if not provided
-        self.d_model = d_model or config['model']['d_model']
-        self.n_heads = n_heads or config['model']['n_heads']
-        self.n_layers = n_layers or config['model']['n_layers']
-        self.d_ff = d_ff or config['model']['d_ff']
-        self.num_experts = num_experts or config['moe']['num_experts']
-        self.top_k = top_k or config['moe']['top_k']
-        self.load_balancer_weight = load_balancer_weight or config['moe']['load_balancer_weight']
-        self.dropout_rate = dropout_rate or config['model']['dropout_rate']
         super().__init__()
-        
+        self.d_model = d_model
         self.pad_token_id = pad_token_id
-        self.use_load_balancer_loss = use_load_balancer_loss
-        
-        # Import routing algorithms
-        from models.routing import HashRouting, TokenChoiceTopKRouting
-        from models.load_balancer import LoadBalancer
-        
-        # Create router
-        if router_type == "hash":
-            router = HashRouting(self.num_experts)
-        elif router_type == "topk":
-            router = TokenChoiceTopKRouting(use_softmax=True)
-        else:
-            raise ValueError(f"Unknown router type: {router_type}")
-        
-        # Create load balancer
-        load_balancer = LoadBalancer(self.num_experts, self.load_balancer_weight) if use_load_balancer_loss else None
+        self.router_type = router_type
         
         # Embeddings
-        self.encoder_embedding = nn.Embedding(vocab_size, self.d_model, padding_idx=self.pad_token_id)
-        self.decoder_embedding = nn.Embedding(vocab_size, self.d_model, padding_idx=self.pad_token_id)
-        
-        # Positional encoding
-        self.pos_encoding = PositionalEncoding(self.d_model, max_len)
+        self.encoder_embedding = nn.Embedding(vocab_size, d_model)
+        self.decoder_embedding = nn.Embedding(vocab_size, d_model)
+        self.pos_encoder = PositionalEncoding(d_model, max_seq_length, dropout)
         
         # Encoder layers
         self.encoder_layers = nn.ModuleList([
-            TransformerEncoderLayer(
-                self.d_model, self.n_heads, self.d_ff, self.num_experts, self.top_k,
-                router, load_balancer, use_load_balancer_loss, self.dropout_rate, use_moe_encoder
+            TransformerEncoderLayerWithMoE(
+                d_model, nhead, num_experts, expert_hidden_dim, top_k,
+                router_type, dropout, use_load_balancer
             )
-            for _ in range(self.n_layers)
+            for _ in range(num_encoder_layers)
         ])
         
         # Decoder layers
         self.decoder_layers = nn.ModuleList([
-            TransformerDecoderLayer(
-                self.d_model, self.n_heads, self.d_ff, self.num_experts, self.top_k,
-                router, load_balancer, use_load_balancer_loss, self.dropout_rate, use_moe_decoder
+            TransformerDecoderLayerWithMoE(
+                d_model, nhead, num_experts, expert_hidden_dim, top_k,
+                router_type, dropout, use_load_balancer
             )
-            for _ in range(self.n_layers)
+            for _ in range(num_decoder_layers)
         ])
         
         # Output projection
-        self.output_proj = nn.Linear(self.d_model, vocab_size)
+        self.output_projection = nn.Linear(d_model, vocab_size)
         
-        self.dropout : torch.nn.Dropout = nn.Dropout(self.dropout_rate) 
-        
-        # Initialize weights
-        self._init_weights()
+        self._init_parameters()
     
-    def _init_weights(self):
-        """Initialize model weights"""
+    def _init_parameters(self):
+        """Initialize parameters"""
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
-    
-    def create_masks(
-        self,
-        src: torch.Tensor,
-        tgt: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Create attention masks for source and target sequences
-        
-        Args:
-            src: Source tensor of shape (batch_size, src_seq_len)
-            tgt: Target tensor of shape (batch_size, tgt_seq_len)
-        Returns:
-            src_mask: Source padding mask
-            tgt_mask: Target mask (padding + causal)
-        """
-        # Source padding mask
-        src_mask = (src != self.pad_token_id).unsqueeze(1).unsqueeze(2)
-        
-        if tgt is not None:
-            # Target padding mask
-            tgt_pad_mask = (tgt != self.pad_token_id).unsqueeze(1).unsqueeze(2)
-            
-            # Causal mask
-            tgt_seq_len = tgt.size(1)
-            causal_mask = torch.tril(torch.ones(tgt_seq_len, tgt_seq_len, device=tgt.device)).bool()
-            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
-            
-            # Combine masks
-            tgt_mask = tgt_pad_mask & causal_mask
-        else:
-            tgt_mask = None
-        
-        return src_mask, tgt_mask
-    
-    def encode(
-        self,
-        src: torch.Tensor,
-        src_mask: torch.Tensor,
-        return_load_balancer_loss: bool = False
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Encode source sequence
-        
-        Args:
-            src: Source tensor of shape (batch_size, src_seq_len)
-            src_mask: Source mask
-            return_load_balancer_loss: Whether to return load balancer loss
-        Returns:
-            encoder_output: Encoded representation
-            total_lb_loss: Total load balancer loss from all layers
-        """
-        # Embed and add positional encoding
-        x = self.encoder_embedding(src) * math.sqrt(self.d_model)
-        x = self.pos_encoding(x)
-        x = self.dropout(x)
-        
-        # Apply encoder layers
-        total_lb_loss: Optional[torch.Tensor] = None
-        for layer in self.encoder_layers:
-            x, lb_loss = layer(x, src_mask, return_load_balancer_loss)
-            if lb_loss is not None:
-                total_lb_loss = lb_loss if total_lb_loss is None else total_lb_loss + lb_loss
-        
-        return x, total_lb_loss if return_load_balancer_loss else None
-    
-    def decode(
-        self,
-        tgt: torch.Tensor,
-        encoder_output: torch.Tensor,
-        src_mask: Optional[torch.Tensor] = None,
-        tgt_mask: Optional[torch.Tensor] = None,
-        return_load_balancer_loss: bool = False
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Decode target sequence
-        
-        Args:
-            tgt: Target tensor of shape (batch_size, tgt_seq_len)
-            encoder_output: Encoder output
-            src_mask: Source mask
-            tgt_mask: Target mask
-            return_load_balancer_loss: Whether to return load balancer loss
-        Returns:
-            decoder_output: Decoded representation
-            total_lb_loss: Total load balancer loss from all layers
-        """
-        # Embed and add positional encoding
-        x = self.decoder_embedding(tgt) * math.sqrt(self.d_model)
-        x = self.pos_encoding(x)
-        x = self.dropout(x)
-        
-        # Apply decoder layers
-        total_lb_loss: Optional[torch.Tensor] = None
-        for layer in self.decoder_layers:
-            x, lb_loss = layer(x, encoder_output, src_mask, tgt_mask, return_load_balancer_loss)
-            if lb_loss is not None:
-                total_lb_loss = lb_loss if total_lb_loss is None else total_lb_loss + lb_loss
-        
-        return x, total_lb_loss if return_load_balancer_loss else None
     
     def forward(
         self,
         src: torch.Tensor,
         tgt: torch.Tensor,
-        return_load_balancer_loss: Optional[bool] = None
+        src_mask: Optional[torch.Tensor] = None,
+        tgt_mask: Optional[torch.Tensor] = None,
+        src_key_padding_mask: Optional[torch.Tensor] = None,
+        tgt_key_padding_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        Forward pass through the model
-        
         Args:
-            src: Source tensor of shape (batch_size, src_seq_len)
-            tgt: Target tensor of shape (batch_size, tgt_seq_len)
-            return_load_balancer_loss: Whether to return load balancer loss
+            src: (batch_size, src_seq_len)
+            tgt: (batch_size, tgt_seq_len)
         Returns:
-            logits: Output logits of shape (batch_size, tgt_seq_len, vocab_size)
-            total_lb_loss: Total load balancer loss
+            logits: (batch_size, tgt_seq_len, vocab_size)
+            aux_loss: Load balancing loss
         """
-        if return_load_balancer_loss is None:
-            return_load_balancer_loss = self.use_load_balancer_loss
-        
-        # Create masks
-        src_mask, tgt_mask = self.create_masks(src, tgt)
-        
         # Encode
-        encoder_output, enc_lb_loss = self.encode(src, src_mask, return_load_balancer_loss)
+        memory, encoder_aux_loss = self.encode(src, src_mask, src_key_padding_mask)
         
         # Decode
-        decoder_output, dec_lb_loss = self.decode(
-            tgt, encoder_output, src_mask, tgt_mask, return_load_balancer_loss
+        output, decoder_aux_loss = self.decode(
+            tgt, memory, tgt_mask, None,
+            tgt_key_padding_mask, src_key_padding_mask
         )
         
-        # Project to vocabulary
-        logits = self.output_proj(decoder_output)
+        # Combine auxiliary losses
+        aux_loss = None
+        if encoder_aux_loss is not None or decoder_aux_loss is not None:
+            aux_loss = 0.0
+            if encoder_aux_loss is not None:
+                aux_loss += encoder_aux_loss
+            if decoder_aux_loss is not None:
+                aux_loss += decoder_aux_loss
         
-        # Combine load balancer losses
-        total_lb_loss : Optional[torch.Tensor] = None
-        if return_load_balancer_loss:
-            if enc_lb_loss is not None:
-                total_lb_loss = enc_lb_loss
-            if dec_lb_loss is not None:
-                total_lb_loss = dec_lb_loss if total_lb_loss is None else total_lb_loss + dec_lb_loss
-        
-        return logits, total_lb_loss
+        return output, aux_loss
     
-    def get_expert_usage(self):
-        """Get expert usage statistics from all MoE layers"""
-        usage_stats = {
+    def encode(
+        self,
+        src: torch.Tensor,
+        src_mask: Optional[torch.Tensor] = None,
+        src_key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Encode source sequence"""
+        # Embed and add positional encoding
+        src_emb = self.encoder_embedding(src) * math.sqrt(self.d_model)
+        src_emb = self.pos_encoder(src_emb)
+        
+        # Pass through encoder layers
+        total_aux_loss = 0.0
+        aux_loss_count = 0
+        output = src_emb
+        
+        for layer in self.encoder_layers:
+            output, aux_loss = layer(output, src_mask, src_key_padding_mask)
+            if aux_loss is not None:
+                total_aux_loss += aux_loss
+                aux_loss_count += 1
+        
+        avg_aux_loss = total_aux_loss / aux_loss_count if aux_loss_count > 0 else None
+        return output, avg_aux_loss
+    
+    def decode(
+        self,
+        tgt: torch.Tensor,
+        memory: torch.Tensor,
+        tgt_mask: Optional[torch.Tensor] = None,
+        memory_mask: Optional[torch.Tensor] = None,
+        tgt_key_padding_mask: Optional[torch.Tensor] = None,
+        memory_key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Decode target sequence"""
+        # Embed and add positional encoding
+        tgt_emb = self.decoder_embedding(tgt) * math.sqrt(self.d_model)
+        tgt_emb = self.pos_encoder(tgt_emb)
+        
+        # Pass through decoder layers
+        total_aux_loss = 0.0
+        aux_loss_count = 0
+        output = tgt_emb
+        
+        for layer in self.decoder_layers:
+            output, aux_loss = layer(
+                output, memory, tgt_mask, memory_mask,
+                tgt_key_padding_mask, memory_key_padding_mask
+            )
+            if aux_loss is not None:
+                total_aux_loss += aux_loss
+                aux_loss_count += 1
+        
+        # Project to vocabulary
+        logits = self.output_projection(output)
+        
+        avg_aux_loss = total_aux_loss / aux_loss_count if aux_loss_count > 0 else None
+        return logits, avg_aux_loss
+    
+    def generate_square_subsequent_mask(self, sz: int) -> torch.Tensor:
+        """Generate causal mask for decoder"""
+        mask = torch.triu(torch.ones(sz, sz), diagonal=1)
+        mask = mask.masked_fill(mask == 1, float('-inf'))
+        return mask
+    
+    def get_all_expert_usage_stats(self):
+        """Get expert usage statistics from all layers"""
+        stats = {
             'encoder': [],
             'decoder': []
         }
         
         for i, layer in enumerate(self.encoder_layers):
-            ffn = getattr(layer, "ffn", None)
-            if ffn is not None and hasattr(ffn, "get_expert_usage"):
-                method = getattr(ffn, "get_expert_usage", None)
-                if callable(method):
-                    usage_stats["encoder"].append(method())
-
+            stats['encoder'].append({
+                'layer': i,
+                'usage': layer.moe.get_expert_usage_stats().cpu().tolist()
+            })
         
         for i, layer in enumerate(self.decoder_layers):
-            ffn = getattr(layer, "ffn", None)
-            if ffn is not None and hasattr(ffn, "get_expert_usage"):
-                method = getattr(ffn, "get_expert_usage", None)
-                if callable(method):
-                    usage_stats['decoder'].append(method())
+            stats['decoder'].append({
+                'layer': i,
+                'usage': layer.moe.get_expert_usage_stats().cpu().tolist()
+            })
         
-        return usage_stats
+        return stats
     
-    def reset_expert_usage(self):
-        """Reset expert usage tracking"""
+    def reset_all_expert_usage_stats(self):
+        """Reset expert usage statistics in all layers"""
         for layer in self.encoder_layers:
-            ffn = getattr(layer, "ffn", None)
-            if ffn is not None and hasattr(ffn, "reset_expert_usage"):
-                method = getattr(ffn, "reset_expert_usage", None)
-                if callable(method):
-                    method()
-        
+            layer.moe.reset_expert_usage_stats()
         for layer in self.decoder_layers:
-            ffn = getattr(layer, "ffn", None)
-            if ffn is not None and hasattr(ffn, "reset_expert_usage"):
-                method = getattr(ffn, "reset_expert_usage", None)
-                if callable(method):
-                    method()
+            layer.moe.reset_expert_usage_stats()

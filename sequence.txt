@@ -1,0 +1,185 @@
+ANLP Assignment 3 - Execution Sequence
+======================================
+
+This file describes the order in which to run the assignment tasks.
+
+SETUP
+-----
+1. Install dependencies:
+   pip install -r requirements.txt
+
+2. Verify config.yaml settings (adjust batch sizes, epochs, etc. based on your GPU)
+
+
+SECTION 1: BASELINE MODELS
+---------------------------
+
+Task 1: BART Inference (Pre-trained model)
+Command: python main.py --config config.yaml --task bart_inference
+Description: Run inference using pre-trained BART model on test set
+Output: results/bart_results.json
+Time: ~15-30 minutes (depending on GPU)
+
+Task 2: Fine-tune Encoder-Decoder Model
+Command: torchrun --nproc_per_node 2  main.py --config config.yaml --task finetune_encoder_decoder
+Description: Fine-tune T5-base (or chosen model) with LoRA on XSum
+Output: results/encoder_decoder_model/ and results/encoder_decoder_results.json
+Time: ~2-4 hours (3 epochs with LoRA)
+
+Task 3: Instruction Tune Model
+Command: python main.py --config config.yaml --task instruction_tune
+Description: Instruction-tune Llama-3.2-1B-Instruct with LoRA on XSum
+Output: results/instruct_model/
+Time: ~2-4 hours (3 epochs with LoRA)
+
+Alternative: Run all baselines at once
+Command: python main.py --config config.yaml --task all_baselines
+
+
+SECTION 2: MOE TRANSFORMER MODELS
+----------------------------------
+
+Task 2.1.1: Train MoE with Hash Routing
+Command: torchrun --nproc_per_node 2  main.py --config config.yaml --task train_moe_hash
+Description: Train MoE Transformer from scratch using hash-based routing
+Output: models/moe_hash_no_lb/
+Time: ~6-12 hours (10 epochs, adjust in config)
+
+Task 2.1.2: Train MoE with Top-K Routing
+Command: python main.py --config config.yaml --task train_moe_topk
+Description: Train MoE Transformer from scratch using top-k token choice routing
+Output: models/moe_top_k_no_lb/
+Time: ~6-12 hours (10 epochs, adjust in config)
+
+Task 2.1.4: Expert Usage Visualization
+Note: Expert usage is automatically tracked and visualized during training
+Output: visualizations/moe_hash_no_lb/ and visualizations/moe_top_k_no_lb/
+
+Alternative: Train both MoE models sequentially
+Command: python main.py --config config.yaml --task all_moe
+
+
+SECTION 3: BONUS TASKS (OPTIONAL)
+----------------------------------
+
+Bonus 1: Load Balancer Loss
+Enable in config.yaml: set use_load_balancer: true
+Then train models with load balancer:
+
+Command: python main.py --config config.yaml --task train_moe_hash_lb
+Output: models/moe_hash_with_lb/
+
+Command: python main.py --config config.yaml --task train_moe_topk_lb
+Output: models/moe_top_k_with_lb/
+
+Bonus 2: Grouped Query Attention (GQA)
+Enable in config.yaml: set bonus.use_gqa: true
+Then implement GQA in models/bonus.py and retrain
+
+Bonus 3: LoRA-based Experts
+Enable in config.yaml: set bonus.use_lora_experts: true
+Then implement LoRA experts in models/bonus.py and retrain
+
+
+SECTION 4: EVALUATION & ANALYSIS
+---------------------------------
+
+Task 2.2: Evaluate All Models
+
+Step 1: Evaluate BART baseline
+Command: python main.py --config config.yaml --task eval_bart
+Output: results/bart/metrics.json
+
+Step 2: Evaluate fine-tuned encoder-decoder
+Command: python main.py --config config.yaml --task eval_encoder_decoder
+Output: results/encoder_decoder/metrics.json
+
+Step 3: Evaluate MoE with hash routing
+Command: python main.py --config config.yaml --task eval_moe_hash
+Output: results/moe_hash_no_lb/metrics.json and summaries.json
+
+Step 4: Evaluate MoE with top-k routing
+Command: python main.py --config config.yaml --task eval_moe_topk
+Output: results/moe_top_k_no_lb/metrics.json and summaries.json
+
+Step 5 (Bonus): Evaluate MoE models with load balancer
+Command: python main.py --config config.yaml --task eval_moe_hash_lb
+Command: python main.py --config config.yaml --task eval_moe_topk_lb
+
+Alternative: Evaluate all models at once
+Command: python main.py --config config.yaml --task all_eval
+
+
+SECTION 5: REPORT GENERATION
+-----------------------------
+
+After running all tasks:
+
+1. Review all metrics in results/ directory
+2. Examine expert usage visualizations in visualizations/ directory
+3. Perform human evaluation on samples (available in metrics.json files)
+4. Compare performance across models:
+   - ROUGE-1, ROUGE-2, ROUGE-L
+   - BLEU
+   - BERTScore
+   - Compression Ratio
+   - Extractiveness
+5. Analyze training curves in training_history.json files
+6. Write report.pdf with:
+   - Model configurations and hyperparameters
+   - Training details (time, compute, convergence)
+   - Evaluation metrics comparison
+   - Expert usage analysis
+   - Human evaluation findings
+   - Discussion and conclusions
+   - (If Bonus) Bonus task results and challenges
+
+
+SECTION 6: SUBMISSION
+----------------------
+
+1. Push code to GitHub Classroom repository
+2. Upload trained models to Hugging Face Hub (optional but recommended):
+   - Use push_to_hub functionality
+   - Include model links in report
+3. Ensure report.pdf is in repository root
+4. Verify all required files are committed:
+   - Source code (models/, pipelines/, main.py)
+   - Configuration (config.yaml)
+   - Documentation (README.md, sequence.txt)
+   - Report (report.pdf)
+
+
+TROUBLESHOOTING
+---------------
+
+Memory Issues:
+- Reduce batch_size in config.yaml
+- Reduce num_experts or d_model
+- Use gradient_accumulation_steps
+- Enable fp16 training
+- Reduce train_samples for quick testing
+
+Time Constraints:
+- Use smaller subsets (set train_samples in config.yaml)
+- Reduce num_epochs
+- Use smaller models (T5-base instead of T5-large)
+- Run tasks in parallel if you have multiple GPUs
+
+Debugging:
+- Test with small data subsets first
+- Check training_history.json for convergence
+- Monitor GPU usage with nvidia-smi
+- Use logging_steps to track progress
+
+
+ESTIMATED TOTAL TIME
+--------------------
+- Baselines: 6-10 hours
+- MoE Training: 12-24 hours (2 models)
+- Evaluation: 2-4 hours
+- Report Writing: 4-6 hours
+- Total: 24-44 hours
+
+Note: Times vary significantly based on GPU, data size, and hyperparameters.
+Start early and use smaller subsets for initial experiments!

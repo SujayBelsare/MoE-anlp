@@ -22,8 +22,6 @@ wandb/
 # Data
 data/
 *.csv
-*.json
-*.txt
 
 # IDE
 .vscode/
@@ -37,3 +35,7 @@ Thumbs.db
 
 # Keep directory structure
 !.gitkeep
+
+
+# Big Results
+results/***/

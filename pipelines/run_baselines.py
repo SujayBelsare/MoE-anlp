@@ -1,607 +1,368 @@
-"""
-Script to run baseline models: BART inference, Finetune encoder-decoder, Instruction tune
-"""
-
 import torch
 from transformers import (
-    AutoTokenizer,
-    AutoModelForSeq2SeqLM,
-    AutoModelForCausalLM,
-    Seq2SeqTrainingArguments,
-    Seq2SeqTrainer,
-    DataCollatorForSeq2Seq,
-    BitsAndBytesConfig
+    AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM,
+    Seq2SeqTrainer, Seq2SeqTrainingArguments,
+    Trainer, TrainingArguments, DataCollatorForSeq2Seq,
+    DataCollatorForLanguageModeling, BitsAndBytesConfig
 )
+from peft import LoraConfig, get_peft_model, TaskType
 from datasets import load_dataset
-from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
-import os
 from tqdm import tqdm
 import json
-from configs import load_config, DEFAULT_CONFIG as config
-from utils import set_seed, ensure_dir
-from typing import Optional
+import os
+from typing import Dict, List
 
-class BARTInference:
-    """Run inference with pre-trained BART model"""
+
+def run_bart_inference(config: Dict, output_dir: str):
+    """Task 1: Run inference with pre-trained BART"""
+    print("\n" + "="*50)
+    print("Task 1: BART Inference")
+    print("="*50)
     
-    def __init__(self, model_name: str = config['baseline_models']['bart'], device: Optional[str] = None):
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Loading BART model: {model_name}")
-        
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name).to(self.device)
-        self.model.eval()
+    model_name = config['baselines']['bart']['model_name']
+    batch_size = config['baselines']['bart']['batch_size']
     
-    @torch.no_grad()
-    def generate_summaries(
-        self,
-        documents,
-        max_length: int = config['dataset']['max_target_length'],
-        num_beams: int = config['evaluation']['num_beams'],
-        batch_size: int = 128
-    ):
-        """Generate summaries for a list of documents"""
-        summaries = []
+    # Load model and tokenizer
+    print(f"Loading {model_name}...")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.eval()
+    
+    # Load test dataset
+    print("Loading test dataset...")
+    test_dataset = load_dataset("EdinburghNLP/xsum", split="test")
+    if config['data']['test_samples']:
+        test_dataset = test_dataset.select(range(config['data']['test_samples']))
+    
+    # Generate summaries
+    summaries = []
+    references = []
+    documents = []
+    
+    print("Generating summaries...")
+    for i in tqdm(range(0, len(test_dataset), batch_size)):
+        batch = test_dataset[i:i+batch_size]
         
-        for i in tqdm(range(0, len(documents), batch_size), desc="Generating summaries"):
-            batch_docs = documents[i:i+batch_size]
-            
-            inputs = self.tokenizer(
-                batch_docs,
-                max_length=config['dataset']['max_source_length'],
-                truncation=True,
-                padding=True,
-                return_tensors="pt"
-            ).to(self.device)
-            
-            outputs = self.model.generate(
+        # Tokenize inputs
+        inputs = tokenizer(
+            batch['document'],
+            max_length=config['data']['max_input_length'],
+            truncation=True,
+            padding=True,
+            return_tensors="pt"
+        ).to(device)
+        
+        # Generate
+        with torch.no_grad():
+            outputs = model.generate(
                 **inputs,
-                max_length=max_length,
-                num_beams=num_beams,
+                max_length=config['evaluation']['max_length'],
+                min_length=config['evaluation']['min_length'],
+                num_beams=config['evaluation']['num_beams'],
                 length_penalty=config['evaluation']['length_penalty'],
-                early_stopping=config['evaluation']['early_stopping']
+                no_repeat_ngram_size=config['evaluation']['no_repeat_ngram_size'],
             )
-            
-            batch_summaries = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
-            summaries.extend(batch_summaries)
         
-        return summaries
+        # Decode
+        batch_summaries = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        summaries.extend(batch_summaries)
+        references.extend(batch['summary'])
+        documents.extend(batch['document'])
     
-    def run_on_test_set(self, output_path: str = "outputs/bart_predictions.json"):
-        """Run inference on XSum test set"""
-        print("Loading XSum test set...")
-        dataset = load_dataset(config['dataset']['name'], split="test")
-        
-        documents = dataset['document']
-        references = dataset['summary']
-        
-        print(f"Generating summaries for {len(documents)} documents...")
-        predictions = self.generate_summaries(documents)
-        
-        # Save results
-        ensure_dir(os.path.dirname(output_path))
-        results = {
-            'predictions': predictions,
-            'references': references,
-            'documents': documents
-        }
-        
-        with open(output_path, 'w') as f:
-            json.dump(results, f, indent=2)
-        
-        print(f"Results saved to {output_path}")
-        return predictions, references
+    # Save results
+    os.makedirs(output_dir, exist_ok=True)
+    results = {
+        'model': model_name,
+        'summaries': summaries,
+        'references': references,
+        'documents': documents,
+    }
+    
+    output_file = os.path.join(output_dir, 'bart_results.json')
+    with open(output_file, 'w') as f:
+        json.dump(results, f, indent=2)
+    
+    print(f"Results saved to {output_file}")
+    print(f"Generated {len(summaries)} summaries")
+    
+    return results
 
 
-class EncoderDecoderFineTuner:
-    """Fine-tune encoder-decoder models (T5, Pegasus)"""
+def finetune_encoder_decoder(config: Dict, output_dir: str):
+    """Task 2: Fine-tune encoder-decoder model"""
+    print("\n" + "="*50)
+    print("Task 2: Fine-tuning Encoder-Decoder Model")
+    print("="*50)
     
-    def __init__(
-        self,
-        model_name: str,
-        use_peft: bool = True,
-        use_8bit: bool = False,
-        device: str = None
-    ):
-        self.model_name = model_name
-        self.use_peft = use_peft
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        
-        print(f"Loading model: {model_name}")
-        
-        # Load tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        
-        # Configure quantization if needed
-        if use_8bit:
-            quantization_config = BitsAndBytesConfig(
-                load_in_8bit=True,
-                llm_int8_threshold=6.0
-            )
-            self.model = AutoModelForSeq2SeqLM.from_pretrained(
-                model_name,
-                quantization_config=quantization_config,
-                device_map="auto"
-            )
-        else:
-            self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
-        
-        # Apply PEFT if specified
-        if use_peft:
-            print("Applying LoRA...")
-            self.model = self._apply_lora(self.model)
-        
-        # Move to device if not using device_map
-        if not use_8bit:
-            self.model.to(self.device)
+    model_name = config['baselines']['encoder_decoder']['model_name']
+    use_peft = config['baselines']['encoder_decoder']['use_peft']
     
-    def _apply_lora(self, model):
-        """Apply LoRA to the model"""
+    # Load tokenizer and model
+    print(f"Loading {model_name}...")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+    
+    # Apply LoRA if specified
+    if use_peft:
+        print("Applying LoRA...")
         lora_config = LoraConfig(
             task_type=TaskType.SEQ_2_SEQ_LM,
-            r=16,
-            lora_alpha=32,
-            lora_dropout=0.1,
-            target_modules=["q", "v"]  # Target attention matrices
+            r=config['baselines']['encoder_decoder']['lora_r'],
+            lora_alpha=config['baselines']['encoder_decoder']['lora_alpha'],
+            lora_dropout=config['baselines']['encoder_decoder']['lora_dropout'],
+            target_modules=["q", "v"],
         )
-        
-        if hasattr(model, 'is_loaded_in_8bit') and model.is_loaded_in_8bit:
-            model = prepare_model_for_kbit_training(model)
-        
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
-        
-        return model
     
-    def prepare_dataset(self, split: str, num_samples: Optional[int] = None):
-        """Prepare dataset for training/evaluation"""
-        dataset = load_dataset(config['dataset']['name'], split=split)
+    # Load datasets
+    print("Loading datasets...")
+    train_dataset = load_dataset("EdinburghNLP/xsum", split="train")
+    val_dataset = load_dataset("EdinburghNLP/xsum", split="validation")
+    
+    if config['data']['train_samples']:
+        train_dataset = train_dataset.select(range(config['data']['train_samples']))
+    if config['data']['val_samples']:
+        val_dataset = val_dataset.select(range(config['data']['val_samples']))
+    
+    # Preprocess function
+    def preprocess_function(examples):
+        inputs = tokenizer(
+            examples['document'],
+            max_length=config['data']['max_input_length'],
+            truncation=True,
+            padding='max_length',
+        )
         
-        if num_samples:
-            dataset = dataset.select(range(min(num_samples, len(dataset))))
-        
-        def preprocess(examples):
-            inputs = self.tokenizer(
-                examples['document'],
-                max_length=config['dataset']['max_source_length'],
-                truncation=True,
-                padding=False
-            )
-            
-            targets = self.tokenizer(
+        # Tokenize targets with padding
+        with tokenizer.as_target_tokenizer():
+            targets = tokenizer(
                 examples['summary'],
-                max_length=config['dataset']['max_target_length'],
+                max_length=config['data']['max_target_length'],
                 truncation=True,
-                padding=False
+                padding='max_length',
             )
-            
-            inputs['labels'] = targets['input_ids']
-            return inputs
         
-        processed_dataset = dataset.map(
-            preprocess,
-            batched=True,
-            remove_columns=dataset.column_names
-        )
+        # Replace padding token id with -100 so it's ignored in loss
+        labels = targets['input_ids']
+        labels = [
+            [(label if label != tokenizer.pad_token_id else -100) for label in label_seq]
+            for label_seq in labels
+        ]
         
-        return processed_dataset
+        inputs['labels'] = labels
+        return inputs
     
-    def train(
-        self,
-        output_dir: str,
-        num_epochs: int = 3,
-        batch_size: int = 8,
-        learning_rate: float = 5e-5,
-        train_samples: int = None,
-        val_samples: int = None,
-        push_to_hub: bool = False
-    ):
-        """Fine-tune the model"""
-        print("Preparing datasets...")
-        train_dataset = self.prepare_dataset("train", train_samples)
-        val_dataset = self.prepare_dataset("validation", val_samples)
-        
-        # Data collator
-        data_collator = DataCollatorForSeq2Seq(
-            self.tokenizer,
-            model=self.model,
-            padding=True
-        )
-        
-        # Training arguments
-        training_args = Seq2SeqTrainingArguments(
-            output_dir=output_dir,
-            num_train_epochs=num_epochs,
-            per_device_train_batch_size=batch_size,
-            per_device_eval_batch_size=batch_size,
-            learning_rate=learning_rate,
-            warmup_steps=500,
-            weight_decay=0.01,
-            logging_dir=f"{output_dir}/logs",
-            logging_steps=100,
-            eval_strategy="epoch",
-            save_strategy="epoch",
-            load_best_model_at_end=True,
-            predict_with_generate=True,
-            generation_max_length=config['dataset']['max_target_length'],
-            generation_num_beams=config['evaluation']['num_beams'],
-            push_to_hub=push_to_hub,
-            report_to="wandb" if not os.getenv("NO_WANDB") else "none"
-        )
-        
-        # Trainer
-        trainer = Seq2SeqTrainer(
-            model=self.model,
-            args=training_args,
-            train_dataset=train_dataset,
-            eval_dataset=val_dataset,
-            tokenizer=self.tokenizer,
-            data_collator=data_collator
-        )
-        
-        # Train
-        print("Starting training...")
-        trainer.train()
-        
-        # Save final model
-        trainer.save_model(f"{output_dir}/final_model")
-        print(f"Model saved to {output_dir}/final_model")
-        
-        return trainer
+    train_dataset = train_dataset.map(preprocess_function, batched=True)
+    val_dataset = val_dataset.map(preprocess_function, batched=True)
     
-    def inference(
-        self,
-        documents,
-        batch_size: int = 8,
-        max_length: int = config['dataset']['max_target_length']
-    ):
-        """Run inference on documents"""
-        self.model.eval()
-        summaries = []
-        
-        for i in tqdm(range(0, len(documents), batch_size), desc="Generating"):
-            batch_docs = documents[i:i+batch_size]
-            
-            inputs = self.tokenizer(
-                batch_docs,
-                max_length=config['dataset']['max_source_length'],
-                truncation=True,
-                padding=True,
-                return_tensors="pt"
-            ).to(self.device)
-            
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    **inputs,
-                    max_length=max_length,
-                    num_beams=config['evaluation']['num_beams'],
-                    length_penalty=config['evaluation']['length_penalty'],
-                    early_stopping=config['evaluation']['early_stopping']
-                )
-            
-            batch_summaries = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
-            summaries.extend(batch_summaries)
-        
-        return summaries
+    # Training arguments
+    model_output_dir = os.path.join(output_dir, 'encoder_decoder_model')
+    training_args = Seq2SeqTrainingArguments(
+        output_dir=model_output_dir,
+        num_train_epochs=config['baselines']['encoder_decoder']['num_epochs'],
+        per_device_train_batch_size=config['baselines']['encoder_decoder']['batch_size'],
+        per_device_eval_batch_size=config['baselines']['encoder_decoder']['batch_size'],
+        learning_rate=config['baselines']['encoder_decoder']['learning_rate'],
+        weight_decay=config['training']['weight_decay'],
+        warmup_steps=config['training']['warmup_steps'],
+        logging_steps=config['training']['logging_steps'],
+        eval_strategy="steps",
+        eval_steps=config['training']['eval_steps'],
+        save_steps=config['training']['save_steps'],
+        save_total_limit=config['training']['save_total_limit'],
+        predict_with_generate=True,
+        fp16=config['baselines']['encoder_decoder']['fp16'] and torch.cuda.is_available(),
+        bf16=config['baselines']['encoder_decoder']['bf16'] and torch.cuda.is_available(),
+        push_to_hub=False,
+        load_best_model_at_end=True,
+        dataloader_pin_memory=True,
+        remove_unused_columns=True,
+        gradient_accumulation_steps=config['training']['gradient_accumulation_steps'],
+        max_grad_norm=config['baselines']['encoder_decoder']['max_grad_norm']
+    )
+    
+    # Data collator
+    data_collator = DataCollatorForSeq2Seq(tokenizer, model=model, padding=True)
+    
+    # Trainer
+    trainer = Seq2SeqTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        data_collator=data_collator,
+    )
+    
+    # Train
+    print("Starting training...")
+    trainer.train()
+    
+    # Save model
+    trainer.save_model(model_output_dir)
+    tokenizer.save_pretrained(model_output_dir)
+    print(f"Model saved to {model_output_dir}")
+    
+    # Run inference on test set
+    print("Running inference on test set...")
+    test_dataset = load_dataset("EdinburghNLP/xsum", split="test")
+    if config['data']['test_samples']:
+        test_dataset = test_dataset.select(range(config['data']['test_samples']))
+    
+    test_dataset = test_dataset.map(preprocess_function, batched=True)
+    predictions = trainer.predict(test_dataset)
+    
+    # Decode predictions
+    summaries = tokenizer.batch_decode(predictions.predictions, skip_special_tokens=True)
+    references = [test_dataset[i]['summary'] for i in range(len(test_dataset))]
+    documents = [test_dataset[i]['document'] for i in range(len(test_dataset))]
+    
+    # Save results
+    results = {
+        'model': model_name,
+        'summaries': summaries,
+        'references': references,
+        'documents': documents,
+    }
+    
+    output_file = os.path.join(output_dir, 'encoder_decoder_results.json')
+    with open(output_file, 'w') as f:
+        json.dump(results, f, indent=2)
+    
+    print(f"Results saved to {output_file}")
+    
+    return results
 
 
-class InstructionTuner:
-    """Instruction tune LLaMA or Qwen models"""
+def instruction_tune_model(config: Dict, output_dir: str):
+    """Task 3: Instruction-tune a model"""
+    print("\n" + "="*50)
+    print("Task 3: Instruction Tuning")
+    print("="*50)
     
-    def __init__(
-        self,
-        model_name: str,
-        use_peft: bool = True,
-        use_4bit: bool = True,
-        device: Optional[str] = None
-    ):
-        self.model_name = model_name
-        self.use_peft = use_peft
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        
-        print(f"Loading instruction model: {model_name}")
-        
-        # Load tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.tokenizer.padding_side = "right"
-        
-        # Configure quantization
-        if use_4bit:
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_use_double_quant=True
-            )
-            
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                quantization_config=bnb_config,
-                device_map="auto",
-                trust_remote_code=True
-            )
-        else:
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                trust_remote_code=True
-            ).to(self.device)
-        
-        # Apply PEFT
-        if use_peft:
-            print("Applying LoRA...")
-            self.model = self._apply_lora(self.model)
+    model_name = config['baselines']['instruct']['model_name']
+    use_peft = config['baselines']['instruct']['use_peft']
+    load_in_8bit = config['baselines']['instruct'].get('load_in_8bit', False)
     
-    def _apply_lora(self, model):
-        """Apply LoRA for instruction tuning"""
+    # Quantization config
+    quantization_config = None
+    if load_in_8bit:
+        quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+    
+    # Load tokenizer and model
+    print(f"Loading {model_name}...")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+    
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        quantization_config=quantization_config,
+        device_map="auto" if load_in_8bit else None,
+    )
+    
+    # Apply LoRA if specified
+    if use_peft:
+        print("Applying LoRA...")
         lora_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
-            r=16,
-            lora_alpha=32,
-            lora_dropout=0.1,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-            bias="none"
+            r=config['baselines']['instruct']['lora_r'],
+            lora_alpha=config['baselines']['instruct']['lora_alpha'],
+            lora_dropout=config['baselines']['instruct']['lora_dropout'],
+            target_modules=["q_proj", "v_proj"],
         )
-        
-        if hasattr(model, 'is_loaded_in_4bit') and model.is_loaded_in_4bit:
-            model = prepare_model_for_kbit_training(model)
-        
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
-        
-        return model
     
-    def format_prompt(self, document: str, summary: str = None):
-        """Format document and summary as instruction prompt"""
-        instruction = "Summarize the following article in one sentence:"
-        
-        if summary is None:
-            prompt = f"<|system|>\nYou are a helpful assistant that summarizes news articles.\n<|user|>\n{instruction}\n\n{document}\n<|assistant|>\n"
-        else:
-            prompt = f"<|system|>\nYou are a helpful assistant that summarizes news articles.\n<|user|>\n{instruction}\n\n{document}\n<|assistant|>\n{summary}"
-        
-        return prompt
+    # Load datasets
+    print("Loading datasets...")
+    train_dataset = load_dataset("EdinburghNLP/xsum", split="train")
+    val_dataset = load_dataset("EdinburghNLP/xsum", split="validation")
     
-    def prepare_dataset(self, split: str, num_samples: int = None):
-        """Prepare dataset for instruction tuning"""
-        dataset = load_dataset(config['dataset']['name'], split=split)
-        
-        if num_samples:
-            dataset = dataset.select(range(min(num_samples, len(dataset))))
-        
-        def preprocess(examples):
-            prompts = []
-            for doc, summ in zip(examples['document'], examples['summary']):
-                prompts.append(self.format_prompt(doc, summ))
-            
-            tokenized = self.tokenizer(
-                prompts,
-                max_length=config['dataset']['max_source_length'] + config['dataset']['max_target_length'],
-                truncation=True,
-                padding=False
-            )
-            
-            tokenized['labels'] = tokenized['input_ids'].copy()
-            
-            return tokenized
-        
-        processed_dataset = dataset.map(
-            preprocess,
-            batched=True,
-            remove_columns=dataset.column_names
+    if config['data']['train_samples']:
+        train_dataset = train_dataset.select(range(config['data']['train_samples']))
+    if config['data']['val_samples']:
+        val_dataset = val_dataset.select(range(config['data']['val_samples']))
+    
+    # Instruction template
+    instruction_template = (
+        "Summarize the following news article in one sentence:\n\n"
+        "{document}\n\nSummary: {summary}"
+    )
+    
+    # Preprocess function
+    def preprocess_function(examples):
+        texts = [
+            instruction_template.format(document=doc, summary=summ)
+            for doc, summ in zip(examples['document'], examples['summary'])
+        ]
+        encodings = tokenizer(
+            texts, 
+            max_length=512, 
+            truncation=True, 
+            padding='max_length'
         )
         
-        return processed_dataset
+        # Clone input_ids for labels and replace padding with -100
+        labels = []
+        for input_ids in encodings['input_ids']:
+            label = [
+                (token_id if token_id != tokenizer.pad_token_id else -100)
+                for token_id in input_ids
+            ]
+            labels.append(label)
+        
+        encodings['labels'] = labels
+        return encodings
     
-    def train(
-        self,
-        output_dir: str,
-        num_epochs: int = 3,
-        batch_size: int = 4,
-        learning_rate: float = 2e-4,
-        train_samples: int = None,
-        val_samples: int = None,
-        push_to_hub: bool = False
-    ):
-        """Instruction tune the model"""
-        from transformers import TrainingArguments, Trainer, DataCollatorForLanguageModeling
-        
-        print("Preparing datasets...")
-        train_dataset = self.prepare_dataset("train", train_samples)
-        val_dataset = self.prepare_dataset("validation", val_samples)
-        
-        # Data collator
-        data_collator = DataCollatorForLanguageModeling(
-            self.tokenizer,
-            mlm=False
-        )
-        
-        # Training arguments
-        training_args = TrainingArguments(
-            output_dir=output_dir,
-            num_train_epochs=num_epochs,
-            per_device_train_batch_size=batch_size,
-            per_device_eval_batch_size=batch_size,
-            gradient_accumulation_steps=4,
-            learning_rate=learning_rate,
-            warmup_steps=100,
-            weight_decay=0.01,
-            logging_dir=f"{output_dir}/logs",
-            logging_steps=50,
-            eval_strategy="epoch",
-            save_strategy="epoch",
-            load_best_model_at_end=True,
-            push_to_hub=push_to_hub,
-            fp16=True,
-            report_to="wandb" if not os.getenv("NO_WANDB") else "none"
-        )
-        
-        # Trainer
-        trainer = Trainer(
-            model=self.model,
-            args=training_args,
-            train_dataset=train_dataset,
-            eval_dataset=val_dataset,
-            tokenizer=self.tokenizer,
-            data_collator=data_collator
-        )
-        
-        # Train
-        print("Starting training...")
-        trainer.train()
-        
-        # Save
-        trainer.save_model(f"{output_dir}/final_model")
-        print(f"Model saved to {output_dir}/final_model")
-        
-        return trainer
+    train_dataset = train_dataset.map(preprocess_function, batched=True)
+    val_dataset = val_dataset.map(preprocess_function, batched=True)
     
-    def inference(
-        self,
-        documents,
-        batch_size: int = 4,
-        max_new_tokens: int = config['dataset']['max_target_length']
-    ):
-        """Generate summaries"""
-        self.model.eval()
-        summaries = []
-        
-        for i in tqdm(range(0, len(documents), batch_size), desc="Generating"):
-            batch_docs = documents[i:i+batch_size]
-            prompts = [self.format_prompt(doc) for doc in batch_docs]
-            
-            inputs = self.tokenizer(
-                prompts,
-                max_length=config['dataset']['max_source_length'],
-                truncation=True,
-                padding=True,
-                return_tensors="pt"
-            ).to(self.device)
-            
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    **inputs,
-                    max_new_tokens=max_new_tokens,
-                    num_beams=config['evaluation']['num_beams'],
-                    temperature=0.7,
-                    do_sample=False,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id
-                )
-            
-            # Decode and extract summary (after the prompt)
-            for j, output in enumerate(outputs):
-                full_text = self.tokenizer.decode(output, skip_special_tokens=True)
-                # Extract only the summary part after <|assistant|>
-                if "<|assistant|>" in full_text:
-                    summary = full_text.split("<|assistant|>")[-1].strip()
-                else:
-                    summary = full_text
-                summaries.append(summary)
-        
-        return summaries
-
-
-def main():
-    # Load configuration
-    config = load_config()
+    # Training arguments
+    model_output_dir = os.path.join(output_dir, 'instruct_model')
+    training_args = TrainingArguments(
+        output_dir=model_output_dir,
+        num_train_epochs=config['baselines']['instruct']['num_epochs'],
+        per_device_train_batch_size=config['baselines']['instruct']['batch_size'],
+        per_device_eval_batch_size=config['baselines']['instruct']['batch_size'],
+        learning_rate=config['baselines']['instruct']['learning_rate'],
+        weight_decay=config['training']['weight_decay'],
+        warmup_steps=config['training']['warmup_steps'],
+        logging_steps=config['training']['logging_steps'],
+        eval_strategy="steps",
+        eval_steps=config['training']['eval_steps'],
+        save_steps=config['training']['save_steps'],
+        save_total_limit=config['training']['save_total_limit'],
+        fp16=config['training']['fp16'] and torch.cuda.is_available(),
+        push_to_hub=False,
+        load_best_model_at_end=True,
+        dataloader_pin_memory=True,
+        remove_unused_columns=False,
+        gradient_accumulation_steps=config['training']['gradient_accumulation_steps'],
+    )
     
-    # Set seed
-    set_seed(config["training"]["seed"])
+    # Data collator
+    data_collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
     
-    # Debug mode
-    if config["debug"]["enabled"]:
-        config["debug"]["train_samples"] = 100
-        config["debug"]["val_samples"] = 50
-        config["debug"]["num_epochs"] = 1
-        print("DEBUG MODE: Using small dataset")
+    # Trainer
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        data_collator=data_collator,
+    )
     
-    # Run task
-    if config["baseline"]["task"] == "bart_inference":
-        print("Running BART inference...")
-        bart = BARTInference()
-        predictions, references = bart.run_on_test_set(
-            output_path=f"{config['paths']['output_dir']}/bart_predictions.json"
-        )
-        print(f"Generated {len(predictions)} summaries")
+    # Train
+    print("Starting training...")
+    trainer.train()
     
-    elif config["baseline"]["task"] == "finetune":
-        model = config["model"].get("name", "google-t5/t5-base")
-        print(f"Fine-tuning {model}...")
-        finetuner = EncoderDecoderFineTuner(
-            model_name=model,
-            use_peft=config["baseline"]["finetune"]["use_peft"],
-            use_8bit=config["baseline"]["finetune"]["use_quantization"]
-        )
-        
-        output_dir = f"{config['paths']['output_dir']}/finetuned_{model.split('/')[-1]}"
-        
-        trainer = finetuner.train(
-            output_dir=output_dir,
-            num_epochs=config["baseline"]["finetune"]["num_epochs"],
-            batch_size=config["baseline"]["finetune"]["batch_size"],
-            learning_rate=config["baseline"]["finetune"]["learning_rate"],
-            train_samples=config["baseline"]["finetune"]["train_samples"],
-            val_samples=config["baseline"]["finetune"]["val_samples"],
-            push_to_hub=config["huggingface"]["push_to_hub"]
-        )
-        
-        # Run inference on test set
-        print("Running inference on test set...")
-        test_dataset = load_dataset(config['dataset']['name'], split="test")
-        predictions = finetuner.inference(test_dataset['document'])
-        
-        results = {
-            'predictions': predictions,
-            'references': test_dataset['summary'],
-            'documents': test_dataset['document']
-        }
-        
-        result_path = f"{output_dir}/test_predictions.json"
-        with open(result_path, 'w') as f:
-            json.dump(results, f, indent=2)
-        print(f"Results saved to {result_path}")
+    # Save model
+    trainer.save_model(model_output_dir)
+    tokenizer.save_pretrained(model_output_dir)
+    print(f"Model saved to {model_output_dir}")
     
-    elif config["baseline"]["task"] == "instruction_tune":
-        model = config["model"].get("name", "meta-llama/Llama-3.2-1B-Instruct")
-        
-        print(f"Instruction tuning {model}...")
-        tuner = InstructionTuner(
-            model_name=model,
-            use_peft=config["baseline"]["finetune"]["use_peft"],
-            use_4bit=config["baseline"]["finetune"]["use_quantization"]
-        )
-        
-        output_dir = f"{config['paths']['output_dir']}/instruction_tuned_{model.split('/')[-1]}"
-        
-        trainer = tuner.train(
-            output_dir=output_dir,
-            num_epochs=config["baseline"]["finetune"]["num_epochs"],
-            batch_size=config["baseline"]["finetune"]["batch_size"],
-            learning_rate=config["baseline"]["finetune"]["learning_rate"],
-            train_samples=config["baseline"]["finetune"]["train_samples"],
-            val_samples=config["baseline"]["finetune"]["val_samples"],
-            push_to_hub=config["huggingface"]["push_to_hub"]
-        )
-        
-        # Run inference on test set
-        print("Running inference on test set...")
-        test_dataset = load_dataset(config['dataset']['name'], split="test")
-        predictions = tuner.inference(test_dataset['document'])
-        
-        results = {
-            'predictions': predictions,
-            'references': test_dataset['summary'],
-            'documents': test_dataset['document']
-        }
-        
-        result_path = f"{output_dir}/test_predictions.json"
-        with open(result_path, 'w') as f:
-            json.dump(results, f, indent=2)
-        print(f"Results saved to {result_path}")
+    print("Instruction tuning completed!")
     
-    print("Done!")
-
-
-if __name__ == "__main__":
-    main()
+    return model_output_dir

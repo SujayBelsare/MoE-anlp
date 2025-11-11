@@ -1,112 +1,110 @@
-# Mode configuration
-mode: baseline  # One of: baseline, train, evaluate
+# Configuration file for ANLP Assignment 3 - MoE Transformer
 
-# Dataset configuration
-dataset:
-  name: EdinburghNLP/xsum
-  max_source_length: 512
-  max_target_length: 64
-
-# Tokenizer configuration
-tokenizer: facebook/bart-base
-
-# Model configuration
-model:
-  d_model: 512
-  n_heads: 8
-  n_layers: 6
-  d_ff: 2048
-  dropout_rate: 0.1
-
-# MoE configuration
-moe:
-  num_experts: 8
-  top_k: 2
-  load_balancer_weight: 0.01
-
-# Training configuration
-training:
-  seed: 2023101033
-  batch_size: 16
-  learning_rate: 5e-5
-  num_epochs: 10
-  warmup_steps: 1000
-  gradient_accumulation_steps: 4
-  max_grad_norm: 1.0
-  train_samples: null  # Limit training samples (for debugging)
-  val_samples: null    # Limit validation samples (for debugging)
-
-# Debug configuration
-debug:
-  enabled: false
-  train_samples: 100
-  val_samples: 50
-  num_epochs: 2
-
-# Data loading
+# Data Configuration
 data:
-  num_workers: 4
+  dataset_name: "EdinburghNLP/xsum"
+  max_input_length: 512
+  max_target_length: 64
+  train_samples: null  # null for full dataset, or specify number
+  val_samples: null
+  test_samples: null
 
-# Device configuration
-device: cuda  # Will be automatically set based on availability
+# Model Configuration
+model:
+  # General
+  vocab_size: 50265  # BART tokenizer vocab size
+  d_model: 512
+  nhead: 8
+  num_encoder_layers: 4
+  num_decoder_layers: 4
+  dim_feedforward: 2048
+  dropout: 0.1
+  max_seq_length: 512
+  
+  # MoE Specific
+  num_experts: 8
+  expert_capacity: null  # null for dynamic, or specify
+  top_k: 2  # number of experts per token
+  expert_hidden_dim: 2048
+  
+  # Load Balancer
+  load_balance_loss_coef: 0.01
+  use_load_balancer: true
 
-# Paths
-paths:
-  checkpoint_dir: checkpoints
-  output_dir: outputs
-  log_dir: logs
+# Training Configuration
+training:
+  batch_size: 8
+  gradient_accumulation_steps: 4
+  num_epochs: 10
+  learning_rate: 0.00005
+  weight_decay: 0.01
+  warmup_steps: 1000
+  seed: 42
+  fp16: true
+  save_steps: 1000
+  eval_steps: 500
+  logging_steps: 100
+  save_total_limit: 3
+  max_grad_norm: 0.5
 
-# HuggingFace Hub
-huggingface:
-  username:  sujay-belsare
-  push_to_hub: false  # Whether to push models to HuggingFace Hub
+# Baseline Models Configuration
+baselines:
+  bart:
+    model_name: "facebook/bart-large-xsum"
+    batch_size: 32  # Reduced from 256 to avoid OOM with multi-GPU
+  
+  encoder_decoder:
+    model_name: "google-t5/t5-base"  # or t5-large
+    batch_size: 32
+    num_epochs: 3
+    learning_rate: 0.000005
+    use_peft: true
+    lora_r: 8
+    lora_alpha: 32
+    lora_dropout: 0.1
+    max_grad_norm: 0.5
+    fp16: false
+    bf16: true
+  
+  instruct:
+    model_name: "meta-llama/Llama-3.2-1B-Instruct"
+    batch_size: 4
+    num_epochs: 3
+    learning_rate: 0.00002
+    use_peft: true
+    lora_r: 16
+    lora_alpha: 32
+    lora_dropout: 0.1
+    load_in_8bit: true
 
-# Weights & Biases configuration
-wandb:
-  enabled: true
-  project: anlp-moe-xsum
-
-# Checkpointing
-checkpointing:
-  save_every: 1        # Save checkpoint every N epochs
-  save_best: true      # Save best model based on validation loss
-
-# Random seed for reproducibility
-seed: 42
-
-# Baseline models
-baseline_models:
-  bart: facebook/bart-large-xsum
-  t5:
-    - google-t5/t5-base
-    - google-t5/t5-large
-    - google/pegasus-large
-  instruction:
-    - meta-llama/Llama-3.2-1B-Instruct
-    - meta-llama/Llama-3.2-3B-Instruct
-    - Qwen/Qwen2.5-3B-Instruct
-
-# Evaluation
+# Evaluation Configuration
 evaluation:
+  batch_size: 16
   num_beams: 4
-  length_penalty: 2.0
-  early_stopping: true
+  length_penalty: 0.6
+  max_length: 64
+  min_length: 10
+  no_repeat_ngram_size: 3
 
-baseline:
-  task: "bart_inference" # Choose from: bart_inference, finetune, instruction_tune
-  finetune:
-    use_peft: false
-    use_quantization: true
-    num_epochs: 10
-    batch_size: 16
-    learning_rate: 5e-5
-    train_samples: null
-    val_samples: null
+# Bonus Configuration
+bonus:
+  use_gqa: false  # Bonus 2
+  num_kv_heads: 4  # for GQA
+  use_lora_experts: false  # Bonus 3
+  lora_rank: 8
+  lora_alpha: 16
 
+# Output Configuration
+output:
+  model_dir: "./models"
+  results_dir: "./results"
+  logs_dir: "./logs"
+  visualizations_dir: "./visualizations"
+  hf_hub_repo: null  # Set your HF repo name, e.g., "username/anlp-moe-xsum"
 
-scoring:
-  predictions_file: "outputs/bart_predictions.json"  # Path to predictions JSON file
-  model_name: "bart"  # Model name for display
-  output_file: "bart_evaluation_results.json"  # Output file for results
-  human_eval_samples: 3  # Number of samples for human evaluation
-  compare_with: []  # Additional prediction files to compare with
+# Hardware Configuration
+hardware:
+  device: "cuda"  # cuda or cpu
+  use_multi_gpu: true  # Use DataParallel for multi-GPU
+  num_workers: 4
+  pin_memory: true

@@ -1,484 +1,407 @@
-"""
-Training script for MoE Transformer model
-"""
-
 import torch
 import torch.nn as nn
-from torch.optim import AdamW
-from transformers import AutoTokenizer, get_linear_schedule_with_warmup
-import os
+from torch.utils.data import DataLoader
+from transformers import AutoTokenizer
+from accelerate import Accelerator
 from tqdm import tqdm
-import wandb
-from pathlib import Path
+import os
 import json
-import numpy as np
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from configs import load_config
 from models.transformer import MoETransformer
-from pipelines.data_loader import XSumDataModule
-from utils import set_seed, ensure_dir, save_checkpoint, count_parameters, format_time
-import time
-
-# Load default configuration
-config = load_config()
+from pipelines.data_loader import get_data_loader
+from typing import Dict
+import matplotlib.pyplot as plt
+import numpy as np
 
 
 class MoETrainer:
-    """Trainer class for MoE Transformer"""
+    """Trainer for MoE Transformer"""
     
-    def __init__(
-        self,
-        model: MoETransformer,
-        tokenizer,
-        train_loader,
-        val_loader,
-        optimizer,
-        scheduler,
-        device: str,
-        config_dict: dict,
-        checkpoint_dir: str = "checkpoints",
-        log_dir: str = "logs",
-        use_wandb: bool = True
-    ):
-        self.model = model
-        self.tokenizer = tokenizer
-        self.train_loader = train_loader
-        self.val_loader = val_loader
-        self.optimizer = optimizer
-        self.scheduler = scheduler
-        self.device = device
-        self.config = config_dict
-        self.checkpoint_dir = checkpoint_dir
-        self.log_dir = log_dir
-        self.use_wandb = use_wandb
+    def __init__(self, config: Dict, router_type: str, use_load_balancer: bool = False):
+        self.config = config
+        self.router_type = router_type
+        self.use_load_balancer = use_load_balancer
         
-        # Create directories
-        ensure_dir(checkpoint_dir)
-        ensure_dir(log_dir)
+        # Initialize accelerator
+        self.accelerator = Accelerator(
+            mixed_precision='fp16' if config['training']['fp16'] else 'no',
+            gradient_accumulation_steps=config['training']['gradient_accumulation_steps'],
+        )
         
-        # Move model to device
-        self.model.to(device)
+        # Print GPU information
+        print(f"Accelerator device: {self.accelerator.device}")
+        print(f"Number of processes: {self.accelerator.num_processes}")
+        if torch.cuda.is_available():
+            print(f"Number of GPUs available: {torch.cuda.device_count()}")
         
-        # Loss function (ignore padding tokens)
-        self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
+        # Setup model name
+        lb_suffix = "_with_lb" if use_load_balancer else "_no_lb"
+        self.model_name = f"moe_{router_type}{lb_suffix}"
         
-        # Training state
-        self.current_epoch = 0
+        # Initialize tokenizer
+        print("Initializing tokenizer...")
+        self.tokenizer = AutoTokenizer.from_pretrained("facebook/bart-base")
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        
+        # Initialize model
+        print(f"Initializing MoE Transformer with {router_type} routing...")
+        self.model = MoETransformer(
+            vocab_size=config['model']['vocab_size'],
+            d_model=config['model']['d_model'],
+            nhead=config['model']['nhead'],
+            num_encoder_layers=config['model']['num_encoder_layers'],
+            num_decoder_layers=config['model']['num_decoder_layers'],
+            num_experts=config['model']['num_experts'],
+            expert_hidden_dim=config['model']['expert_hidden_dim'],
+            top_k=config['model']['top_k'],
+            router_type=router_type,
+            dropout=config['model']['dropout'],
+            max_seq_length=config['model']['max_seq_length'],
+            use_load_balancer=use_load_balancer,
+            pad_token_id=self.tokenizer.pad_token_id,
+        )
+        
+        # Count parameters
+        total_params = sum(p.numel() for p in self.model.parameters())
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        print(f"Total parameters: {total_params:,}")
+        print(f"Trainable parameters: {trainable_params:,}")
+        
+        # Initialize optimizer
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=config['training']['learning_rate'],
+            weight_decay=config['training']['weight_decay'],
+        )
+        
+        # Load data
+        print("Loading data...")
+        self.train_loader = get_data_loader(
+            self.tokenizer,
+            config['training']['batch_size'],
+            'train',
+            config['data']['max_input_length'],
+            config['data']['max_target_length'],
+            config['data']['train_samples'],
+            config['hardware']['num_workers'],
+        )
+        
+        self.val_loader = get_data_loader(
+            self.tokenizer,
+            config['training']['batch_size'],
+            'validation',
+            config['data']['max_input_length'],
+            config['data']['max_target_length'],
+            config['data']['val_samples'],
+            config['hardware']['num_workers'],
+        )
+        
+        # Learning rate scheduler
+        num_training_steps = len(self.train_loader) * config['training']['num_epochs']
+        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            self.optimizer,
+            max_lr=config['training']['learning_rate'],
+            total_steps=num_training_steps,
+            pct_start=config['training']['warmup_steps'] / num_training_steps,
+        )
+        
+        # Prepare with accelerator
+        self.model, self.optimizer, self.train_loader, self.val_loader, self.scheduler = \
+            self.accelerator.prepare(
+                self.model, self.optimizer, self.train_loader, self.val_loader, self.scheduler
+            )
+        
+        # Loss function
+        self.criterion = nn.CrossEntropyLoss(ignore_index=self.tokenizer.pad_token_id)
+        
+        # Tracking
         self.global_step = 0
         self.best_val_loss = float('inf')
-        
-        # Expert usage tracking
+        self.training_history = []
         self.expert_usage_history = []
-        
+    
     def train_epoch(self, epoch: int):
         """Train for one epoch"""
         self.model.train()
         total_loss = 0
-        total_ce_loss = 0
-        total_lb_loss = 0
+        total_lm_loss = 0
+        total_aux_loss = 0
         
-        progress_bar = tqdm(self.train_loader, desc=f"Epoch {epoch}")
+        progress_bar = tqdm(
+            self.train_loader,
+            desc=f"Epoch {epoch}",
+            disable=not self.accelerator.is_local_main_process,
+        )
         
         for batch_idx, batch in enumerate(progress_bar):
-            # Move batch to device
-            input_ids = batch['input_ids'].to(self.device)
-            attention_mask = batch['attention_mask'].to(self.device)
-            labels = batch['labels'].to(self.device)
+            # Prepare inputs
+            src = batch['input_ids']
+            tgt = batch['labels']
+            src_key_padding_mask = (src == self.tokenizer.pad_token_id)
+            tgt_key_padding_mask = (tgt == self.tokenizer.pad_token_id)
             
-            # Prepare decoder input (shift labels right)
-            decoder_input_ids = torch.cat([
-                torch.full((labels.size(0), 1), self.tokenizer.pad_token_id, device=self.device),
-                labels[:, :-1]
-            ], dim=1)
+            # Prepare decoder input (shift right)
+            tgt_input = tgt[:, :-1]
+            tgt_output = tgt[:, 1:]
+            tgt_key_padding_mask = tgt_key_padding_mask[:, :-1]
+            
+            # Create causal mask for decoder
+            tgt_mask = self.model.module.generate_square_subsequent_mask(
+                tgt_input.size(1)
+            ).to(src.device) if hasattr(self.model, 'module') else \
+                self.model.generate_square_subsequent_mask(
+                tgt_input.size(1)
+            ).to(src.device)
             
             # Forward pass
-            logits, lb_loss = self.model(
-                input_ids,
-                decoder_input_ids,
-                return_load_balancer_loss=True
+            logits, aux_loss = self.model(
+                src, tgt_input,
+                src_key_padding_mask=src_key_padding_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask,
+                tgt_mask=tgt_mask,
             )
             
-            # Compute cross-entropy loss
-            ce_loss = self.criterion(
-                logits.view(-1, logits.size(-1)),
-                labels.view(-1)
+            # Compute language modeling loss
+            lm_loss = self.criterion(
+                logits.reshape(-1, logits.size(-1)),
+                tgt_output.reshape(-1)
             )
             
             # Total loss
-            loss = ce_loss
-            if lb_loss is not None:
-                loss = loss + lb_loss
-                total_lb_loss += lb_loss.item()
+            loss = lm_loss
+            if aux_loss is not None and self.use_load_balancer:
+                aux_loss_scaled = self.config['model']['load_balance_loss_coef'] * aux_loss
+                loss = loss + aux_loss_scaled
+                total_aux_loss += aux_loss_scaled.item()
             
             # Backward pass
-            loss.backward()
+            self.accelerator.backward(loss)
             
-            # Gradient clipping
-            if self.config.get('max_grad_norm', 1.0) > 0:
-                torch.nn.utils.clip_grad_norm_(
+            if (batch_idx + 1) % self.config['training']['gradient_accumulation_steps'] == 0:
+                # Gradient clipping
+                self.accelerator.clip_grad_norm_(
                     self.model.parameters(),
-                    self.config['max_grad_norm']
+                    self.config['training']['max_grad_norm']
                 )
-            
-            # Optimizer step
-            if (batch_idx + 1) % self.config.get('gradient_accumulation_steps', 1) == 0:
+                
+                # Optimizer step
                 self.optimizer.step()
                 self.scheduler.step()
                 self.optimizer.zero_grad()
+                
+                self.global_step += 1
             
-            # Update statistics
+            # Track losses
             total_loss += loss.item()
-            total_ce_loss += ce_loss.item()
-            self.global_step += 1
+            total_lm_loss += lm_loss.item()
             
             # Update progress bar
             progress_bar.set_postfix({
                 'loss': f"{loss.item():.4f}",
-                'ce_loss': f"{ce_loss.item():.4f}",
-                'lb_loss': f"{lb_loss.item() if lb_loss is not None else 0:.4f}",
-                'lr': f"{self.scheduler.get_last_lr()[0]:.2e}"
+                'lm_loss': f"{lm_loss.item():.4f}",
+                'lr': f"{self.scheduler.get_last_lr()[0]:.2e}",
             })
             
-            # Log to wandb
-            if self.use_wandb and batch_idx % 10 == 0:
-                wandb.log({
-                    'train/loss': loss.item(),
-                    'train/ce_loss': ce_loss.item(),
-                    'train/lb_loss': lb_loss.item() if lb_loss is not None else 0,
-                    'train/learning_rate': self.scheduler.get_last_lr()[0],
-                    'train/epoch': epoch,
-                    'train/step': self.global_step
-                })
-            
-            # Track expert usage periodically
-            if batch_idx % 100 == 0:
-                usage_stats = self.model.get_expert_usage()
-                self.expert_usage_history.append({
+            # Logging
+            if self.global_step % self.config['training']['logging_steps'] == 0:
+                self.training_history.append({
                     'step': self.global_step,
                     'epoch': epoch,
-                    'usage': usage_stats
-                })
-        
-        # Average losses
-        avg_loss = total_loss / len(self.train_loader)
-        avg_ce_loss = total_ce_loss / len(self.train_loader)
-        avg_lb_loss = total_lb_loss / len(self.train_loader) if total_lb_loss > 0 else 0
-        
-        return avg_loss, avg_ce_loss, avg_lb_loss
-    
-    @torch.no_grad()
-    def validate(self, epoch: int):
-        """Validate the model"""
-        self.model.eval()
-        total_loss = 0
-        total_ce_loss = 0
-        total_lb_loss = 0
-        
-        progress_bar = tqdm(self.val_loader, desc="Validation")
-        
-        for batch in progress_bar:
-            # Move batch to device
-            input_ids = batch['input_ids'].to(self.device)
-            labels = batch['labels'].to(self.device)
-            
-            # Prepare decoder input
-            decoder_input_ids = torch.cat([
-                torch.full((labels.size(0), 1), self.tokenizer.pad_token_id, device=self.device),
-                labels[:, :-1]
-            ], dim=1)
-            
-            # Forward pass
-            logits, lb_loss = self.model(
-                input_ids,
-                decoder_input_ids,
-                return_load_balancer_loss=True
-            )
-            
-            # Compute loss
-            ce_loss = self.criterion(
-                logits.view(-1, logits.size(-1)),
-                labels.view(-1)
-            )
-            
-            loss = ce_loss
-            if lb_loss is not None:
-                loss = loss + lb_loss
-                total_lb_loss += lb_loss.item()
-            
-            total_loss += loss.item()
-            total_ce_loss += ce_loss.item()
-            
-            progress_bar.set_postfix({'val_loss': f"{loss.item():.4f}"})
-        
-        # Average losses
-        avg_loss = total_loss / len(self.val_loader)
-        avg_ce_loss = total_ce_loss / len(self.val_loader)
-        avg_lb_loss = total_lb_loss / len(self.val_loader) if total_lb_loss > 0 else 0
-        
-        return avg_loss, avg_ce_loss, avg_lb_loss
-    
-    def train(self, num_epochs: int, save_every: int = 1, push_to_hub: bool = False):
-        """Main training loop"""
-        print(f"\nStarting training for {num_epochs} epochs...")
-        print(f"Total parameters: {count_parameters(self.model)[0]:,}")
-        print(f"Trainable parameters: {count_parameters(self.model)[1]:,}")
-        
-        start_time = time.time()
-        
-        for epoch in range(1, num_epochs + 1):
-            self.current_epoch = epoch
-            epoch_start = time.time()
-            
-            # Train
-            train_loss, train_ce, train_lb = self.train_epoch(epoch)
-            
-            # Validate
-            val_loss, val_ce, val_lb = self.validate(epoch)
-            
-            epoch_time = time.time() - epoch_start
-            
-            # Log epoch results
-            print(f"\nEpoch {epoch}/{num_epochs} - Time: {format_time(epoch_time)}")
-            print(f"Train Loss: {train_loss:.4f} (CE: {train_ce:.4f}, LB: {train_lb:.4f})")
-            print(f"Val Loss: {val_loss:.4f} (CE: {val_ce:.4f}, LB: {val_lb:.4f})")
-            
-            if self.use_wandb:
-                wandb.log({
-                    'epoch': epoch,
-                    'train/epoch_loss': train_loss,
-                    'train/epoch_ce_loss': train_ce,
-                    'train/epoch_lb_loss': train_lb,
-                    'val/loss': val_loss,
-                    'val/ce_loss': val_ce,
-                    'val/lb_loss': val_lb,
-                    'time/epoch_time': epoch_time
+                    'loss': loss.item(),
+                    'lm_loss': lm_loss.item(),
+                    'aux_loss': aux_loss.item() if aux_loss is not None else 0.0,
+                    'lr': self.scheduler.get_last_lr()[0],
                 })
             
             # Save checkpoint
-            if epoch % save_every == 0:
-                checkpoint_path = os.path.join(
-                    self.checkpoint_dir,
-                    f"checkpoint_epoch_{epoch}.pt"
-                )
-                save_checkpoint(
-                    self.model,
-                    self.optimizer,
-                    epoch,
-                    val_loss,
-                    checkpoint_path
-                )
-                print(f"Checkpoint saved to {checkpoint_path}")
+            if self.global_step % self.config['training']['save_steps'] == 0:
+                self.save_checkpoint(f"step_{self.global_step}")
             
-            # Save best model
+            # Evaluation
+            if self.global_step % self.config['training']['eval_steps'] == 0:
+                val_loss = self.evaluate()
+                self.model.train()
+                
+                if val_loss < self.best_val_loss:
+                    self.best_val_loss = val_loss
+                    self.save_checkpoint("best")
+        
+        avg_loss = total_loss / len(self.train_loader)
+        avg_lm_loss = total_lm_loss / len(self.train_loader)
+        
+        return avg_loss, avg_lm_loss
+    
+    def evaluate(self):
+        """Evaluate on validation set"""
+        self.model.eval()
+        total_loss = 0
+        
+        with torch.no_grad():
+            for batch in tqdm(self.val_loader, desc="Evaluating", 
+                            disable=not self.accelerator.is_local_main_process):
+                src = batch['input_ids']
+                tgt = batch['labels']
+                src_key_padding_mask = (src == self.tokenizer.pad_token_id)
+                
+                tgt_input = tgt[:, :-1]
+                tgt_output = tgt[:, 1:]
+                tgt_key_padding_mask = (tgt[:, :-1] == self.tokenizer.pad_token_id)
+                
+                tgt_mask = self.model.module.generate_square_subsequent_mask(
+                    tgt_input.size(1)
+                ).to(src.device) if hasattr(self.model, 'module') else \
+                    self.model.generate_square_subsequent_mask(
+                    tgt_input.size(1)
+                ).to(src.device)
+                
+                logits, _ = self.model(
+                    src, tgt_input,
+                    src_key_padding_mask=src_key_padding_mask,
+                    tgt_key_padding_mask=tgt_key_padding_mask,
+                    tgt_mask=tgt_mask,
+                )
+                
+                loss = self.criterion(
+                    logits.reshape(-1, logits.size(-1)),
+                    tgt_output.reshape(-1)
+                )
+                
+                total_loss += loss.item()
+        
+        avg_loss = total_loss / len(self.val_loader)
+        print(f"Validation Loss: {avg_loss:.4f}")
+        
+        return avg_loss
+    
+    def train(self):
+        """Main training loop"""
+        print(f"\nStarting training for {self.config['training']['num_epochs']} epochs...")
+        
+        for epoch in range(1, self.config['training']['num_epochs'] + 1):
+            train_loss, lm_loss = self.train_epoch(epoch)
+            
+            print(f"\nEpoch {epoch} Summary:")
+            print(f"  Train Loss: {train_loss:.4f}")
+            print(f"  LM Loss: {lm_loss:.4f}")
+            
+            # Track expert usage
+            self.track_expert_usage(epoch)
+            
+            # Evaluate
+            val_loss = self.evaluate()
+            
             if val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
-                best_path = os.path.join(self.checkpoint_dir, "best_model.pt")
-                save_checkpoint(
-                    self.model,
-                    self.optimizer,
-                    epoch,
-                    val_loss,
-                    best_path
-                )
-                print(f"Best model saved! Val loss: {val_loss:.4f}")
-                
-                # Push to HuggingFace Hub
-                if push_to_hub:
-                    self.push_to_huggingface_hub(epoch)
+                self.save_checkpoint("best")
         
-        total_time = time.time() - start_time
-        print(f"\nTraining completed in {format_time(total_time)}")
+        # Save final model
+        self.save_checkpoint("final")
+        
+        # Visualize expert usage
+        self.visualize_expert_usage()
+        
+        print("\nTraining completed!")
+    
+    def track_expert_usage(self, epoch: int):
+        """Track expert usage statistics"""
+        if hasattr(self.model, 'module'):
+            stats = self.model.module.get_all_expert_usage_stats()
+        else:
+            stats = self.model.get_all_expert_usage_stats()
+        
+        self.expert_usage_history.append({
+            'epoch': epoch,
+            'step': self.global_step,
+            'stats': stats,
+        })
+    
+    def visualize_expert_usage(self):
+        """Visualize expert usage over time"""
+        if not self.expert_usage_history:
+            return
+        
+        output_dir = os.path.join(
+            self.config['output']['visualizations_dir'],
+            self.model_name
+        )
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Plot encoder expert usage
+        num_encoder_layers = self.config['model']['num_encoder_layers']
+        fig, axes = plt.subplots(num_encoder_layers, 1, figsize=(12, 4 * num_encoder_layers))
+        
+        if num_encoder_layers == 1:
+            axes = [axes]
+        
+        for layer_idx in range(num_encoder_layers):
+            usage_over_time = []
+            epochs = []
+            
+            for record in self.expert_usage_history:
+                epochs.append(record['epoch'])
+                layer_usage = record['stats']['encoder'][layer_idx]['usage']
+                usage_over_time.append(layer_usage)
+            
+            usage_array = np.array(usage_over_time)
+            
+            for expert_idx in range(self.config['model']['num_experts']):
+                axes[layer_idx].plot(
+                    epochs,
+                    usage_array[:, expert_idx],
+                    label=f'Expert {expert_idx}',
+                    marker='o'
+                )
+            
+            axes[layer_idx].set_xlabel('Epoch')
+            axes[layer_idx].set_ylabel('Usage Proportion')
+            axes[layer_idx].set_title(f'Encoder Layer {layer_idx} - Expert Usage Over Time')
+            axes[layer_idx].legend()
+            axes[layer_idx].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'encoder_expert_usage.png'), dpi=300)
+        plt.close()
+        
+        print(f"Expert usage visualizations saved to {output_dir}")
+    
+    def save_checkpoint(self, name: str):
+        """Save model checkpoint"""
+        output_dir = os.path.join(self.config['output']['model_dir'], self.model_name)
+        os.makedirs(output_dir, exist_ok=True)
+        
+        checkpoint_dir = os.path.join(output_dir, name)
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        
+        # Unwrap model if using accelerator
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
+        
+        # Save model
+        torch.save({
+            'model_state_dict': unwrapped_model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'global_step': self.global_step,
+            'best_val_loss': self.best_val_loss,
+            'config': self.config,
+            'router_type': self.router_type,
+            'use_load_balancer': self.use_load_balancer,
+        }, os.path.join(checkpoint_dir, 'checkpoint.pt'))
+        
+        # Save training history
+        with open(os.path.join(output_dir, 'training_history.json'), 'w') as f:
+            json.dump(self.training_history, f, indent=2)
         
         # Save expert usage history
-        usage_path = os.path.join(self.log_dir, "expert_usage_history.json")
-        with open(usage_path, 'w') as f:
+        with open(os.path.join(output_dir, 'expert_usage_history.json'), 'w') as f:
             json.dump(self.expert_usage_history, f, indent=2)
-        print(f"Expert usage history saved to {usage_path}")
-    
-    def push_to_huggingface_hub(self, epoch: int):
-        """Push model to HuggingFace Hub"""
-        try:
-            from huggingface_hub import HfApi, create_repo
-            
-            repo_name = f"{self.config.get('hf_username', 'user')}/moe-xsum-{self.config['routing']}"
-            
-            print(f"Pushing to HuggingFace Hub: {repo_name}")
-            
-            # Create repo if it doesn't exist
-            try:
-                create_repo(repo_name, exist_ok=True)
-            except Exception as e:
-                print(f"Repo creation warning: {e}")
-            
-            # Save model
-            model_path = os.path.join(self.checkpoint_dir, f"hf_model_epoch_{epoch}")
-            ensure_dir(model_path)
-            
-            torch.save(self.model.state_dict(), os.path.join(model_path, "pytorch_model.bin"))
-            
-            # Save config
-            model_config = {
-                'vocab_size': self.model.output_proj.out_features,
-                'd_model': self.model.d_model,
-                'routing': self.config['routing'],
-                'num_experts': self.config.get('num_experts', config.NUM_EXPERTS),
-                'top_k': self.config.get('top_k', config.TOP_K),
-                'epoch': epoch
-            }
-            
-            with open(os.path.join(model_path, "config.json"), 'w') as f:
-                json.dump(model_config, f, indent=2)
-            
-            # Upload
-            api = HfApi()
-            api.upload_folder(
-                folder_path=model_path,
-                repo_id=repo_name,
-                repo_type="model"
-            )
-            
-            print(f"Successfully pushed to {repo_name}")
-            
-        except Exception as e:
-            print(f"Failed to push to hub: {e}")
+        
+        print(f"Checkpoint saved to {checkpoint_dir}")
 
 
-def main():
-    # Load configuration
-    config = load_config()
-    
-    # Debug mode configuration
-    debug_config = config.get('debug', {})
-    if debug_config.get('enabled', False):
-        config['training']['train_samples'] = debug_config.get('train_samples', 100)
-        config['training']['val_samples'] = debug_config.get('val_samples', 50)
-        config['training']['num_epochs'] = debug_config.get('num_epochs', 2)
-        print("DEBUG MODE: Using small dataset")
-    
-    # Set seed for reproducibility
-    set_seed(config["training"]["seed"])
-    
-    # Device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    
-    # Debug mode was already handled in debug_config section above
-    
-    # Initialize wandb
-    use_wandb = config["wandb"]["enabled"]
-    if use_wandb:
-        wandb.init(
-            project=config["wandb"]["project"],
-            name=f"moe_{config['model']['routing']}_k{config['moe']['top_k']}_e{config['moe']['num_experts']}",
-            config=config
-        )
-    
-    # Load tokenizer
-    print(f"Loading tokenizer: {config['model']['tokenizer']}")
-    tokenizer = AutoTokenizer.from_pretrained(config['model']['tokenizer'])
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    
-    vocab_size = len(tokenizer)
-    print(f"Vocabulary size: {vocab_size}")
-    
-    # Create data module
-    print("Loading dataset...")
-    data_module = XSumDataModule(
-        tokenizer_name=config['model']['tokenizer'],
-        batch_size=config['training']['batch_size'],
-        max_source_length=config['dataset']['max_source_length'],
-        max_target_length=config['dataset']['max_target_length'],
-        num_workers=config['dataset']['num_workers'],
-        train_samples=config['dataset']['train_samples'],
-        val_samples=config['dataset']['val_samples']
-    )
-    
-    train_loader = data_module.train_dataloader()
-    val_loader = data_module.val_dataloader()
-    
-    print(f"Train batches: {len(train_loader)}")
-    print(f"Val batches: {len(val_loader)}")
-    
-    # Create model
-    print(f"\nCreating MoE Transformer with {config['model']['routing']} routing...")
-    model = MoETransformer(
-        vocab_size=vocab_size,
-        d_model=config['model']['d_model'],
-        n_heads=config['model']['n_heads'],
-        n_layers=config['model']['n_layers'],
-        d_ff=config['model']['d_ff'],
-        num_experts=config['moe']['num_experts'],
-        top_k=config['moe']['top_k'],
-        router_type=config['model']['routing'],
-        load_balancer_weight=config['moe']['load_balancer_weight'],
-        use_load_balancer_loss=config['moe']['use_load_balancer'],
-        dropout=config['model']['dropout'],
-        pad_token_id=tokenizer.pad_token_id,
-        use_moe_encoder=True,
-        use_moe_decoder=True
-    )
-    
-    total_params, trainable_params = count_parameters(model)
-    print(f"Total parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
-    
-    # Create optimizer
-    optimizer = AdamW(model.parameters(), lr=config['training']['learning_rate'])
-    
-    # Create scheduler
-    total_steps = len(train_loader) * config['training']['epochs'] // config['training']['gradient_accumulation_steps']
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=config['training']['warmup_steps'],
-        num_training_steps=total_steps
-    )
-    
-    # Create checkpoint directory name
-    checkpoint_dir = os.path.join(
-        config['paths']['checkpoints'],
-        f"moe_{config['model']['routing']}_k{config['moe']['top_k']}_e{config['moe']['num_experts']}"
-    )
-    
-    # Create config dict for trainer
-    config_dict = {
-        'routing': config['model']['routing'],
-        'num_experts': config['moe']['num_experts'],
-        'top_k': config['moe']['top_k'],
-        'use_load_balancer': config['moe']['use_load_balancer'],
-        'load_balancer_weight': config['moe']['load_balancer_weight'],
-        'gradient_accumulation_steps': config['training']['gradient_accumulation_steps'],
-        'max_grad_norm': config['training']['max_grad_norm'],
-        'hf_username': config['huggingface']['username']
-    }
-    
-    # Create trainer
-    trainer = MoETrainer(
-        model=model,
-        tokenizer=tokenizer,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        device=device,
-        config_dict=config_dict,
-        checkpoint_dir=checkpoint_dir,
-        log_dir=config['paths']['logs'],
-        use_wandb=use_wandb
-    )
-    
-    # Train
-    trainer.train(
-        num_epochs=config['training']['epochs'],
-        save_every=1,
-        push_to_hub=config['huggingface']['push_to_hub']
-    )
-    
-    if use_wandb:
-        wandb.finish()
-    
-    print("\nTraining complete!")
-
-
-if __name__ == "__main__":
-    main()
+def train_moe_model(config: Dict, router_type: str, use_load_balancer: bool = False):
+    """Train a single MoE model"""
+    trainer = MoETrainer(config, router_type, use_load_balancer)
+    trainer.train()
