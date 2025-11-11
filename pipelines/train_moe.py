@@ -24,17 +24,15 @@ class MoETrainer:
         self.router_type = router_type
         self.use_load_balancer = use_load_balancer
         
-        # Initialize accelerator
+        # Initialize accelerator with DDP kwargs to handle unused parameters in MoE
+        from accelerate import DistributedDataParallelKwargs
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        
         self.accelerator = Accelerator(
             mixed_precision='fp16' if config['training']['fp16'] else 'no',
             gradient_accumulation_steps=config['training']['gradient_accumulation_steps'],
+            kwargs_handlers=[ddp_kwargs],
         )
-        
-        # Print GPU information
-        print(f"Accelerator device: {self.accelerator.device}")
-        print(f"Number of processes: {self.accelerator.num_processes}")
-        if torch.cuda.is_available():
-            print(f"Number of GPUs available: {torch.cuda.device_count()}")
         
         # Setup model name
         lb_suffix = "_with_lb" if use_load_balancer else "_no_lb"
@@ -89,9 +87,11 @@ class MoETrainer:
             config['hardware']['num_workers'],
         )
         
+        # Use evaluation batch_size for validation loader
+        eval_batch_size = config.get('evaluation', {}).get('batch_size', config['training']['batch_size'])
         self.val_loader = get_data_loader(
             self.tokenizer,
-            config['training']['batch_size'],
+            eval_batch_size,
             'validation',
             config['data']['max_input_length'],
             config['data']['max_target_length'],
@@ -193,6 +193,30 @@ class MoETrainer:
                 self.optimizer.zero_grad()
                 
                 self.global_step += 1
+                
+                # Logging (only after optimizer step)
+                if self.global_step % self.config['training']['logging_steps'] == 0:
+                    self.training_history.append({
+                        'step': self.global_step,
+                        'epoch': epoch,
+                        'loss': loss.item(),
+                        'lm_loss': lm_loss.item(),
+                        'aux_loss': aux_loss.item() if aux_loss is not None else 0.0,
+                        'lr': self.scheduler.get_last_lr()[0],
+                    })
+                
+                # Save checkpoint (only after optimizer step, skip step 0)
+                if self.global_step > 0 and self.global_step % self.config['training']['save_steps'] == 0:
+                    self.save_checkpoint(f"step_{self.global_step}")
+                
+                # Evaluation (only after optimizer step, skip step 0)
+                if self.global_step > 0 and self.global_step % self.config['training']['eval_steps'] == 0:
+                    val_loss = self.evaluate()
+                    self.model.train()
+                    
+                    if val_loss < self.best_val_loss:
+                        self.best_val_loss = val_loss
+                        self.save_checkpoint("best")
             
             # Track losses
             total_loss += loss.item()
@@ -204,30 +228,6 @@ class MoETrainer:
                 'lm_loss': f"{lm_loss.item():.4f}",
                 'lr': f"{self.scheduler.get_last_lr()[0]:.2e}",
             })
-            
-            # Logging
-            if self.global_step % self.config['training']['logging_steps'] == 0:
-                self.training_history.append({
-                    'step': self.global_step,
-                    'epoch': epoch,
-                    'loss': loss.item(),
-                    'lm_loss': lm_loss.item(),
-                    'aux_loss': aux_loss.item() if aux_loss is not None else 0.0,
-                    'lr': self.scheduler.get_last_lr()[0],
-                })
-            
-            # Save checkpoint
-            if self.global_step % self.config['training']['save_steps'] == 0:
-                self.save_checkpoint(f"step_{self.global_step}")
-            
-            # Evaluation
-            if self.global_step % self.config['training']['eval_steps'] == 0:
-                val_loss = self.evaluate()
-                self.model.train()
-                
-                if val_loss < self.best_val_loss:
-                    self.best_val_loss = val_loss
-                    self.save_checkpoint("best")
         
         avg_loss = total_loss / len(self.train_loader)
         avg_lm_loss = total_lm_loss / len(self.train_loader)
@@ -238,6 +238,7 @@ class MoETrainer:
         """Evaluate on validation set"""
         self.model.eval()
         total_loss = 0
+        num_batches = 0
         
         with torch.no_grad():
             for batch in tqdm(self.val_loader, desc="Evaluating", 
@@ -250,10 +251,10 @@ class MoETrainer:
                 tgt_output = tgt[:, 1:]
                 tgt_key_padding_mask = (tgt[:, :-1] == self.tokenizer.pad_token_id)
                 
-                tgt_mask = self.model.module.generate_square_subsequent_mask(
-                    tgt_input.size(1)
-                ).to(src.device) if hasattr(self.model, 'module') else \
-                    self.model.generate_square_subsequent_mask(
+                # Get the unwrapped model for accessing methods
+                unwrapped_model = self.accelerator.unwrap_model(self.model)
+                
+                tgt_mask = unwrapped_model.generate_square_subsequent_mask(
                     tgt_input.size(1)
                 ).to(src.device)
                 
@@ -269,10 +270,15 @@ class MoETrainer:
                     tgt_output.reshape(-1)
                 )
                 
-                total_loss += loss.item()
+                # Gather losses from all processes
+                total_loss += self.accelerator.gather(loss).mean().item()
+                num_batches += 1
         
-        avg_loss = total_loss / len(self.val_loader)
-        print(f"Validation Loss: {avg_loss:.4f}")
+        avg_loss = total_loss / num_batches
+        
+        # Only print on main process
+        if self.accelerator.is_local_main_process:
+            print(f"Validation Loss: {avg_loss:.4f}")
         
         return avg_loss
     

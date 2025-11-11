@@ -13,7 +13,9 @@ import numpy as np
 from pipelines.run_baselines import (
     run_bart_inference,
     finetune_encoder_decoder,
-    instruction_tune_model
+    instruction_tune_model,
+    inference_instruct_model,
+    instruct_base_model,
 )
 from pipelines.train_moe import train_moe_model
 from pipelines.evaluate import evaluate_moe_model, evaluate_baseline
@@ -61,6 +63,8 @@ def main():
             "bart_inference",
             "finetune_encoder_decoder",
             "instruction_tune",
+            "instruct_inference",
+            "instruct_base_model",
             "train_moe_hash",
             "train_moe_topk",
             "train_moe_hash_lb",
@@ -104,6 +108,12 @@ def main():
     elif args.task == "instruction_tune":
         instruction_tune_model(config, config['output']['results_dir'])
     
+    elif args.task == "instruct_inference":
+        inference_instruct_model(config, config['output']['results_dir'], model_path="/scratch/sujayb/MoE-anlp/results/instruct_model/checkpoint-4785")
+    
+    elif args.task == "instruct_base_model":
+        instruct_base_model(config, config['output']['results_dir'])
+
     elif args.task == "train_moe_hash":
         train_moe_model(config, router_type="hash", use_load_balancer=False)
     

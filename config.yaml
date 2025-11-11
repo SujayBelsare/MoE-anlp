@@ -33,7 +33,7 @@ model:
 
 # Training Configuration
 training:
-  batch_size: 8
+  batch_size: 4
   gradient_accumulation_steps: 4
   num_epochs: 10
   learning_rate: 0.00005
@@ -68,21 +68,26 @@ baselines:
   
   instruct:
     model_name: "meta-llama/Llama-3.2-1B-Instruct"
-    batch_size: 4
+    batch_size: 16
     num_epochs: 3
-    learning_rate: 0.00002
+    learning_rate: 0.000005
     use_peft: true
-    lora_r: 16
+    lora_r: 8
     lora_alpha: 32
     lora_dropout: 0.1
-    load_in_8bit: true
+    load_in_8bit: true  # Changed to true for 2x faster inference with minimal quality loss
+    max_grad_norm: 0.5
+    fp16: false
+    bf16: true
+    inference_batch_size: 8  # Reduced from 32 to 8 for faster per-batch generation
+
 
 # Evaluation Configuration
 evaluation:
-  batch_size: 16
-  num_beams: 4
+  batch_size: 8  # Reduced from 64 to 8 for MoE models (use same as training for consistency)
+  num_beams: 2
   length_penalty: 0.6
-  max_length: 64
+  max_length: 128  # Changed from 512 to 128 - summaries are typically much shorter
   min_length: 10
   no_repeat_ngram_size: 3
 

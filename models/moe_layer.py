@@ -121,17 +121,17 @@ class SparseMoELayer(nn.Module):
         # Normalize the top-k scores
         top_k_scores = top_k_scores / top_k_scores.sum(dim=-1, keepdim=True)
         
-        # Initialize output
-        output = torch.zeros_like(x)
+        # Initialize output with explicit dtype for mixed precision
+        output = torch.zeros_like(x, dtype=x.dtype, device=x.device)
         
         # Process each token through its selected experts
         for i in range(num_tokens):
-            token_output = torch.zeros_like(x[i])
+            token_output = torch.zeros_like(x[i], dtype=x.dtype, device=x.device)
             for j in range(self.top_k):
                 expert_idx = top_k_indices[i, j].item()
                 expert_weight = top_k_scores[i, j]
                 expert_out = self.experts[expert_idx](x[i:i+1])
-                token_output += expert_weight * expert_out.squeeze(0)
+                token_output += expert_weight * expert_out.squeeze(0).to(x.dtype)
             output[i] = token_output
         
         return output, top_k_scores, top_k_indices
@@ -147,15 +147,21 @@ class SparseMoELayer(nn.Module):
         expert_indices = expert_indices.unsqueeze(1)  # (num_tokens, 1)
         
         # Create uniform weights
-        expert_weights = torch.ones((num_tokens, 1), device=x.device)
+        expert_weights = torch.ones((num_tokens, 1), device=x.device, dtype=x.dtype)
         
-        # Initialize output
-        output = torch.zeros_like(x)
+        # Initialize output with same dtype as input (important for mixed precision)
+        output = torch.zeros_like(x, dtype=x.dtype, device=x.device)
         
-        # Process each token through its assigned expert
-        for i in range(num_tokens):
-            expert_idx = expert_indices[i, 0].item()
-            output[i] = self.experts[expert_idx](x[i:i+1]).squeeze(0)
+        # Vectorized processing: group tokens by expert
+        for expert_idx in range(self.num_experts):
+            # Find all tokens assigned to this expert
+            mask = (expert_indices.squeeze(1) == expert_idx)
+            if mask.any():
+                # Process all tokens for this expert in one batch
+                expert_input = x[mask]
+                expert_output = self.experts[expert_idx](expert_input)
+                # Ensure dtype consistency for mixed precision training
+                output[mask] = expert_output.to(output.dtype)
         
         return output, expert_weights, expert_indices
     

@@ -27,9 +27,11 @@ Output: results/encoder_decoder_model/ and results/encoder_decoder_results.json
 Time: ~2-4 hours (3 epochs with LoRA)
 
 Task 3: Instruction Tune Model
-Command: python main.py --config config.yaml --task instruction_tune
+Command: torchrun --nproc_per_node 2 main.py --config config.yaml --task instruction_tune
 Description: Instruction-tune Llama-3.2-1B-Instruct with LoRA on XSum
 Output: results/instruct_model/
+Command: torchrun --nproc_per_node 2 main.py --config config.yaml --task instruct_inference
+Output: results/instruct_model_results.json
 Time: ~2-4 hours (3 epochs with LoRA)
 
 Alternative: Run all baselines at once
@@ -40,7 +42,7 @@ SECTION 2: MOE TRANSFORMER MODELS
 ----------------------------------
 
 Task 2.1.1: Train MoE with Hash Routing
-Command: torchrun --nproc_per_node 2  main.py --config config.yaml --task train_moe_hash
+Command: accelerate launch main.py --config config.yaml --task train_moe_hash
 Description: Train MoE Transformer from scratch using hash-based routing
 Output: models/moe_hash_no_lb/
 Time: ~6-12 hours (10 epochs, adjust in config)

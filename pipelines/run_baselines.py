@@ -5,7 +5,7 @@ from transformers import (
     Trainer, TrainingArguments, DataCollatorForSeq2Seq,
     DataCollatorForLanguageModeling, BitsAndBytesConfig
 )
-from peft import LoraConfig, get_peft_model, TaskType
+from peft import LoraConfig, get_peft_model, TaskType, PeftModel
 from datasets import load_dataset
 from tqdm import tqdm
 import json
@@ -174,18 +174,16 @@ def finetune_encoder_decoder(config: Dict, output_dir: str):
         save_steps=config['training']['save_steps'],
         save_total_limit=config['training']['save_total_limit'],
         predict_with_generate=True,
-        fp16=config['baselines']['encoder_decoder']['fp16'] and torch.cuda.is_available(),
-        bf16=config['baselines']['encoder_decoder']['bf16'] and torch.cuda.is_available(),
+        fp16=config['training']['fp16'] and torch.cuda.is_available(),
         push_to_hub=False,
         load_best_model_at_end=True,
         dataloader_pin_memory=True,
-        remove_unused_columns=True,
+        remove_unused_columns=False,
         gradient_accumulation_steps=config['training']['gradient_accumulation_steps'],
-        max_grad_norm=config['baselines']['encoder_decoder']['max_grad_norm']
     )
     
     # Data collator
-    data_collator = DataCollatorForSeq2Seq(tokenizer, model=model, padding=True)
+    data_collator = DataCollatorForSeq2Seq(tokenizer, model=model)
     
     # Trainer
     trainer = Seq2SeqTrainer(
@@ -255,6 +253,7 @@ def instruction_tune_model(config: Dict, output_dir: str):
     print(f"Loading {model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = 'left'  # Important for decoder-only models
     
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
@@ -365,4 +364,347 @@ def instruction_tune_model(config: Dict, output_dir: str):
     
     print("Instruction tuning completed!")
     
+    # Run inference on test set
+    print("\nRunning inference on test set...")
+    inference_instruct_model(config, output_dir, model_output_dir)
+    
     return model_output_dir
+
+
+def inference_instruct_model(config: Dict, output_dir: str, model_path: str = None):
+    """
+    Run inference with instruction-tuned model
+    
+    Args:
+        config: Configuration dictionary
+        output_dir: Directory to save results
+        model_path: Path to fine-tuned LoRA checkpoint (if None, uses default path)
+    """
+    print("\n" + "="*50)
+    print("Instruction Model Inference")
+    print("="*50)
+    
+    # Determine model path
+    if model_path is None:
+        # Try to find the latest checkpoint
+        instruct_model_dir = os.path.join(output_dir, 'instruct_model')
+        if os.path.exists(instruct_model_dir):
+            checkpoints = [d for d in os.listdir(instruct_model_dir) if d.startswith('checkpoint-')]
+            if checkpoints:
+                # Sort by checkpoint number and get the latest
+                checkpoints.sort(key=lambda x: int(x.split('-')[1]))
+                model_path = os.path.join(instruct_model_dir, checkpoints[-1])
+                print(f"Using latest checkpoint: {model_path}")
+            else:
+                model_path = instruct_model_dir
+        else:
+            print(f"Model directory not found at {instruct_model_dir}")
+            return None
+    
+    if not os.path.exists(model_path):
+        print(f"Model not found at {model_path}")
+        return None
+    
+    # Get base model name from config
+    base_model_name = config['baselines']['instruct']['model_name']
+    
+    # Load tokenizer from base model
+    print(f"Loading tokenizer from {base_model_name}...")
+    tokenizer = AutoTokenizer.from_pretrained(base_model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    # CRITICAL: Set padding side to left for decoder-only models
+    tokenizer.padding_side = 'left'
+    
+    # Check if we need quantization
+    load_in_8bit = config['baselines']['instruct'].get('load_in_8bit', False)
+    quantization_config = None
+    if load_in_8bit:
+        quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+    
+    # Load base model
+    print(f"Loading base model {base_model_name}...")
+    base_model = AutoModelForCausalLM.from_pretrained(
+        base_model_name,
+        quantization_config=quantization_config,
+        device_map="auto" if load_in_8bit else None,
+        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+    )
+    
+    # Load LoRA adapter
+    print(f"Loading LoRA adapter from {model_path}...")
+    model = PeftModel.from_pretrained(base_model, model_path)
+    
+    # Set to eval mode
+    model.eval()
+    
+    # Move to device if not using quantization
+    if not load_in_8bit and torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = None  # Already on device via device_map="auto"
+    
+    # Load test dataset
+    print("Loading test dataset...")
+    test_dataset = load_dataset("EdinburghNLP/xsum", split="test")
+    if config['data']['test_samples']:
+        test_dataset = test_dataset.select(range(config['data']['test_samples']))
+    
+    # Instruction template
+    instruction_template = (
+        "Summarize the following news article in one sentence:\n\n"
+        "{document}\n\nSummary:"
+    )
+    
+    # Generate summaries
+    summaries = []
+    references = []
+    documents = []
+    
+    batch_size = config['baselines']['instruct']['batch_size']
+    
+    print(f"Generating summaries for {len(test_dataset)} samples...")
+    
+    with torch.no_grad():
+        for i in tqdm(range(0, len(test_dataset), batch_size)):
+            batch = test_dataset[i:i+batch_size]
+            
+            # Handle single sample vs batch
+            if isinstance(batch['document'], str):
+                batch_documents = [batch['document']]
+                batch_references = [batch['summary']]
+            else:
+                batch_documents = batch['document']
+                batch_references = batch['summary']
+            
+            # Create prompts
+            prompts = [
+                instruction_template.format(document=doc)
+                for doc in batch_documents
+            ]
+            
+            # Tokenize
+            inputs = tokenizer(
+                prompts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=config['data']['max_input_length'],
+            )
+            
+            # Move to device if not using device_map
+            if device is not None:
+                inputs = {k: v.to(device) for k, v in inputs.items()}
+            
+            # Generate
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=config['evaluation']['max_length'],
+                min_new_tokens=config['evaluation']['min_length'],
+                num_beams=1,  # Use greedy decoding to avoid issues
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                bos_token_id=tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.eos_token_id,
+            )
+            
+            # Decode - only decode the newly generated tokens (after the prompt)
+            batch_summaries = []
+            for j, output in enumerate(outputs):
+                # Get the length of the input prompt (account for padding on left)
+                input_ids = inputs['input_ids'][j]
+                
+                # Find where actual tokens start (skip left padding)
+                non_pad_mask = input_ids != tokenizer.pad_token_id
+                if non_pad_mask.any():
+                    first_real_token = non_pad_mask.nonzero()[0].item()
+                    prompt_length = len(input_ids)
+                else:
+                    prompt_length = 0
+                
+                # Decode only the generated part
+                generated_tokens = output[prompt_length:]
+                summary = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+                
+                # Clean up the summary
+                summary = summary.strip()
+                
+                # Remove any remaining instruction text if present
+                if "Summary:" in summary:
+                    summary = summary.split("Summary:")[-1].strip()
+                
+                # If summary is too long, take first sentence
+                if len(summary) == 0:
+                    summary = "No summary generated."
+                elif '.' in summary:
+                    # Take first sentence
+                    first_sentence = summary.split('.')[0].strip() + '.'
+                    if len(first_sentence.split()) >= 5:  # Make sure it's substantial
+                        summary = first_sentence
+                
+                batch_summaries.append(summary)
+            
+            summaries.extend(batch_summaries)
+            references.extend(batch_references)
+            documents.extend(batch_documents)
+    
+    # Save results
+    results = {
+        'model': 'instruct_finetuned',
+        'model_path': model_path,
+        'summaries': summaries,
+        'references': references,
+        'documents': documents,
+    }
+    
+    output_file = os.path.join(output_dir, 'instruct_results.json')
+    with open(output_file, 'w') as f:
+        json.dump(results, f, indent=2)
+    
+    print(f"\nResults saved to {output_file}")
+    print(f"Generated {len(summaries)} summaries")
+    
+    # Print a few examples
+    print("\n" + "="*50)
+    print("Sample Outputs:")
+    print("="*50)
+    for i in range(min(3, len(summaries))):
+        print(f"\nExample {i+1}:")
+        print(f"Document (first 200 chars): {documents[i][:200]}...")
+        print(f"Reference: {references[i]}")
+        print(f"Generated: {summaries[i]}")
+        print("-" * 50)
+    
+    return results
+
+def instruct_base_model(config: Dict, output_dir: str):
+    """Task 4: Inference with base instruction model without fine-tuning"""
+    print("\n" + "="*50)
+    print("Inference with Base Instruction Model")
+    print("="*50)
+
+    # load meta-llama/Llama-3.2-1B-Instruct and do inference directly on that
+    model_name = config['baselines']['instruct']['model_name']
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        device_map="auto" if torch.cuda.is_available() else None,
+        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = 'left'  # Important for decoder-only models
+    model.eval()
+
+    # Load test dataset
+    print("Loading test dataset...")
+    test_dataset = load_dataset("EdinburghNLP/xsum", split="test")
+    if config['data']['test_samples']:
+        test_dataset = test_dataset.select(range(config['data']['test_samples']))
+    # Instruction template
+    instruction_template = (
+        "Summarize the following news article in one sentence:\n\n"
+        "{document}\n\nSummary:"
+    )
+    # Generate summaries
+    summaries = []
+    references = []
+    documents = []
+
+    batch_size = config['baselines']['instruct']['batch_size']
+    print(f"Generating summaries for {len(test_dataset)} samples...")
+
+    with torch.no_grad():
+        for i in tqdm(range(0, len(test_dataset), batch_size)):
+            batch = test_dataset[i:i+batch_size]
+
+            # Handle single sample vs batch
+            if isinstance(batch['document'], str):
+                batch_documents = [batch['document']]
+                batch_references = [batch['summary']]
+            else:
+                batch_documents = batch['document']
+                batch_references = batch['summary']
+
+            # Create prompts
+            prompts = [
+                instruction_template.format(document=doc)
+                for doc in batch_documents
+            ]
+
+            # Tokenize
+            inputs = tokenizer(
+                prompts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=config['data']['max_input_length'],
+            )
+            if torch.cuda.is_available():
+                inputs = {k: v.to('cuda') for k, v in inputs.items()}
+
+            # Generate
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=config['evaluation']['max_length'],
+                min_new_tokens=config['evaluation']['min_length'],
+                num_beams=1,  # Use greedy decoding to avoid issues
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                bos_token_id=tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.eos_token_id,
+            )
+
+            # Decode - only decode the newly generated tokens (after the prompt)
+            batch_summaries = []
+            for j, output in enumerate(outputs):
+                # Get the length of the input prompt (account for padding on left)
+                input_ids = inputs['input_ids'][j]
+
+                # Find where actual tokens start (skip left padding)
+                non_pad_mask = input_ids != tokenizer.pad_token_id
+                if non_pad_mask.any():
+                    first_real_token = non_pad_mask.nonzero()[0].item()
+                    prompt_length = len(input_ids)
+                else:
+                    prompt_length = 0
+
+                # Decode only the generated part
+                generated_tokens = output[prompt_length:]
+                summary = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+
+                # Clean up the summary
+                summary = summary.strip()
+
+                # Remove any remaining instruction text if present
+                if "Summary:" in summary:
+                    summary = summary.split("Summary:")[-1].strip()
+
+                # If summary is too long, take first sentence
+                if len(summary) == 0:
+                    summary = "No summary generated."
+                elif '.' in summary:
+                    # Take first sentence
+                    first_sentence = summary.split('.')[0].strip() + '.'
+                    if len(first_sentence.split()) >= 5:  # Make sure it's substantial
+                        summary = first_sentence
+                batch_summaries.append(summary)
+            summaries.extend(batch_summaries)
+            references.extend(batch_references)
+            documents.extend(batch_documents)
+    # Save results
+    results = {
+        'model': model_name,
+        'summaries': summaries,
+        'references': references,
+        'documents': documents,
+    }
+    output_file = os.path.join(output_dir, 'instruct_base_model_results.json')
+    with open(output_file, 'w') as f:
+        json.dump(results, f, indent=2)
+    print(f"\nResults saved to {output_file}")
+    print(f"Generated {len(summaries)} summaries")
+    
+    return results
+    
